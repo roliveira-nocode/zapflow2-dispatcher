@@ -30,7 +30,7 @@ interface ContactResult {
   contact_id: string;
   name: string;
   phone: string;
-  ok: boolean;
+  accepted: boolean;
   status: number | null;
   message_state: string | null;
   provider_message_id: string | null;
@@ -205,7 +205,7 @@ async function sendToContact(
 
     return {
       ...base,
-      ok: response.ok,
+      accepted: response.ok,
       status: response.status,
       message_state: messageState,
       provider_message_id: providerMessageId,
@@ -216,7 +216,7 @@ async function sendToContact(
     // Never print the token; only surface the error message. Keep going.
     return {
       ...base,
-      ok: false,
+      accepted: false,
       status: null,
       message_state: null,
       provider_message_id: null,
@@ -283,7 +283,7 @@ app.post("/api/dispatch", async (req: Request, res: Response) => {
         contact_id: contact.contact_id,
         name: contact.name,
         phone: contact.phone,
-        ok: false,
+        accepted: false,
         status: null,
         message_state: null,
         provider_message_id: null,
@@ -294,12 +294,12 @@ app.post("/api/dispatch", async (req: Request, res: Response) => {
     }
 
     const result = await sendToContact(contact, phone, template, apiToken);
-    console.log(`  ${contact.name}: ${result.ok ? "sent" : "failed"}`);
+    console.log(`  ${contact.name}: ${result.accepted ? "accepted" : "failed"}`);
     results.push(result);
   }
 
-  const sent = results.filter((r) => r.ok).length;
-  const failed = results.length - sent;
+  const accepted = results.filter((r) => r.accepted).length;
+  const failed = results.length - accepted;
 
   return res.json({
     success: failed === 0,
@@ -308,8 +308,9 @@ app.post("/api/dispatch", async (req: Request, res: Response) => {
     template_id: template.template_id,
     template_label: template.label,
     total: payload.contacts.length,
-    sent,
+    accepted,
     failed,
+    delivery_status: "pending",
     results,
   });
 });

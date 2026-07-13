@@ -6,6 +6,10 @@ WhatsApp template message through **Umbler Talk**.
 This is intentionally tiny: no frontend, no database, no batch sending, no
 chatbot logic. Just one script that fires a single template message.
 
+> **Integrating a website with the deployed API?** See
+> [docs/INTEGRATION.md](docs/INTEGRATION.md) for the production base URL,
+> endpoints, payload shape, examples, and caveats.
+
 ## Requirements
 
 - Node.js **18+** (uses the built-in `fetch`). Tested on Node 24.
@@ -142,14 +146,15 @@ the raw provider response):
   "template_id": "aYSx9KNRwPC0hnHe",
   "template_label": "zapflow_primeiro_contato_v1",
   "total": 1,
-  "sent": 1,
+  "accepted": 1,
   "failed": 0,
+  "delivery_status": "pending",
   "results": [
     {
       "contact_id": "juan",
       "name": "Juan",
       "phone": "+5521971906175",
-      "ok": true,
+      "accepted": true,
       "status": 200,
       "message_state": "Processing",
       "provider_message_id": "...",
@@ -159,6 +164,9 @@ the raw provider response):
   ]
 }
 ```
+
+> `accepted` means Umbler accepted the request — **not** that WhatsApp delivered
+> or read the message. `delivery_status` is always `"pending"`.
 
 Example call (does a **real** dispatch — only run when you mean it):
 
