@@ -1,0 +1,19 @@
+{
+  "campaign_id": "teste_rafael_juan_001",
+  "campaign_name": "Teste interno Juan e Rafael",
+  "template_id": "aYSx9KNRwPC0hnHe",
+  "contacts": [
+    {
+      "contact_id": "juan",
+      "name": "Juan",
+      "phone": "+5521971906175",
+      "reason": "estamos validando o primeiro teste de disparo em campanha via Zapflow"
+    },
+    {
+      "contact_id": "rafael",
+      "name": "Rafael",
+      "phone": "+5521998050582",
+      "reason": "estamos validando o envio automático de campanhas pelo Zapflow"
+    }
+  ]
+}
