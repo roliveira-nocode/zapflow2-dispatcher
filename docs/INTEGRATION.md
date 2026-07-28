@@ -337,3 +337,129 @@ export async function dispatchCampaign(input: {
 Never hardcode or commit the real `DISPATCH_SECRET` or the Umbler token. Read the
 secret from a server-only environment variable. The Umbler token lives only on
 the dispatcher server — the website never needs it.
+
+## 17. SiteFlow endpoint — `POST /api/siteflow/dispatch`
+
+Dedicated **server-to-server** endpoint for the SiteFlow integration. It sends
+one template message to one visitor who has explicitly consented, and is
+independent of the campaign endpoint in §4: different secret, different payload,
+different template. Everything in §1–§16 about `/api/dispatch` still applies to
+`/api/dispatch` and is unchanged by this endpoint.
+
+```
+POST https://zapflow2-dispatcher.vercel.app/api/siteflow/dispatch
+```
+
+### 17.1 Authentication
+
+| Header                        | Value                                     |
+| ----------------------------- | ----------------------------------------- |
+| `Content-Type`                | `application/json`                        |
+| `x-siteflow-dispatch-secret`  | the value of `SITEFLOW_DISPATCH_SECRET`   |
+
+The same rule as §6 applies: the secret is **server-side only**. Call this
+endpoint from your backend, never from browser code. A missing or wrong secret
+returns `401`; if `SITEFLOW_DISPATCH_SECRET` is not configured on the server the
+endpoint returns `503` and nothing else on the server is affected.
+
+### 17.2 Request
+
+```json
+{
+  "client_id": "client-example",
+  "client_brand": "Marca Exemplo",
+  "conversation_id": "conversation-example",
+  "lead_id": "lead-example",
+  "visitor_first_name": "Ana",
+  "phone": "+5511900000000",
+  "consent": {
+    "granted": true,
+    "granted_at": "2026-07-28T14:00:00Z",
+    "source": "siteflow-web"
+  }
+}
+```
+
+| Field                | Type    | Required | Notes                                              |
+| -------------------- | ------- | -------- | -------------------------------------------------- |
+| `client_id`          | string  | yes      | Your client identifier                              |
+| `client_brand`       | string  | yes      | Template param `{{2}}`                              |
+| `conversation_id`    | string  | yes      | SiteFlow conversation identifier                    |
+| `lead_id`            | string  | yes      | SiteFlow lead identifier                            |
+| `visitor_first_name` | string  | yes      | Template param `{{1}}`                              |
+| `phone`              | string  | yes      | Brazilian number; normalized exactly as in §7       |
+| `consent.granted`    | boolean | yes      | Must be exactly `true`, otherwise `403`             |
+| `consent.granted_at` | string  | yes      | ISO-8601 timestamp of the consent                   |
+| `consent.source`     | string  | yes      | Where consent was collected, e.g. `siteflow-web`    |
+
+### 17.3 Template
+
+Logical name: **`siteflow_continuar_conversa`**.
+
+| Placeholder | Value                |
+| ----------- | -------------------- |
+| `{{1}}`     | `visitor_first_name` |
+| `{{2}}`     | `client_brand`       |
+
+It also carries the static quick-reply button **"Receber resumo"**. Params are
+always sent in the order `[visitor_first_name, client_brand]`.
+
+The provider template ID is read from the server-only variable
+`SITEFLOW_TEMPLATE_ID`. It is never hardcoded in source, never accepted from the
+request, and never returned in a response — only the logical name is echoed back.
+
+### 17.4 Dry-run mode
+
+When the server has `DRY_RUN=1` (or `true`), the endpoint validates the request
+in full and then **simulates** the send:
+
+- Umbler is never called and no WhatsApp message is sent;
+- `SITEFLOW_TEMPLATE_ID` is not required;
+- the template does not need to be approved;
+- the response contains `"dry_run": true` and `"message_state": "simulated"`.
+
+`DRY_RUN` applies to this endpoint only — `POST /api/dispatch` ignores it and
+always behaves as documented in §4.
+
+### 17.5 Successful response
+
+```json
+{
+  "success": true,
+  "dry_run": true,
+  "client_id": "client-example",
+  "conversation_id": "conversation-example",
+  "lead_id": "lead-example",
+  "template_name": "siteflow_continuar_conversa",
+  "phone": "+5511*******00",
+  "params": ["Ana", "Marca Exemplo"],
+  "accepted": true,
+  "status": null,
+  "message_state": "simulated",
+  "provider_message_id": null,
+  "chat_id": null,
+  "delivery_status": "pending",
+  "error": null
+}
+```
+
+`phone` is returned **masked**, and the full number is never written to the
+server logs. As in §11, `accepted` only means the request was accepted — never
+that WhatsApp delivered or read the message; `delivery_status` is always
+`"pending"`. A provider rejection on a real send returns HTTP `200` with
+`"success": false`, `"accepted": false` and a populated `error`.
+
+### 17.6 Error responses
+
+| Status | `error`                                     | Cause                                            |
+| ------ | ------------------------------------------- | ------------------------------------------------ |
+| `400`  | `"<field> is required."`                    | Missing or empty required field                   |
+| `400`  | `"consent.granted must be a boolean."`      | Wrong type for `consent.granted`                  |
+| `400`  | `"consent.granted_at must be an ISO-8601 date string."` | Unparseable timestamp              |
+| `400`  | `"Invalid phone number."`                   | Phone failed Brazilian normalization              |
+| `401`  | `"Unauthorized."`                           | Missing or wrong `x-siteflow-dispatch-secret`     |
+| `403`  | `"Consent was not granted."`                | `consent.granted` is not exactly `true`           |
+| `503`  | `"SiteFlow dispatch is not configured."`    | `SITEFLOW_DISPATCH_SECRET` unset on the server    |
+| `503`  | `"SiteFlow template is not configured."`    | Real send attempted with `SITEFLOW_TEMPLATE_ID` unset |
+
+All errors use the same envelope as §10: `{ "success": false, "error": "..." }`.

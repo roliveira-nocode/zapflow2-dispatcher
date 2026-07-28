@@ -1,10 +1,9 @@
 import "dotenv/config";
 import express, { type Request, type Response } from "express";
 
-// Fixed values for this proof of concept (safe to keep in source — not secrets).
-const FROM_PHONE = "+5521990047343";
-const ORGANIZATION_ID = "aQDFQYsjuFhKAP11";
-const API_URL = "https://app-utalk.umbler.com/api/v1/template-messages/simplified/";
+import { normalizePhone } from "./phone.js";
+import { createSiteflowDispatchHandler } from "./siteflow.js";
+import { sendTemplateMessage } from "./umbler.js";
 
 interface Contact {
   contact_id: string;
@@ -58,44 +57,6 @@ function requireEnv(name: string): string {
     process.exit(1);
   }
   return value;
-}
-
-/**
- * Normalize a Brazilian phone number to "+<digits>" E.164 form.
- *
- * - Strips every non-numeric character.
- * - If the number has 11 digits and no 55 country code, prefixes 55.
- * - Accepts only Brazilian numbers: starts with 55 and has 12 or 13 digits.
- *
- * Returns the normalized phone, or null if it is obviously invalid.
- */
-function normalizePhone(raw: string): string | null {
-  let digits = raw.replace(/\D/g, "");
-
-  if (!digits.startsWith("55") && digits.length === 11) {
-    digits = `55${digits}`;
-  }
-
-  if (!digits.startsWith("55") || (digits.length !== 12 && digits.length !== 13)) {
-    return null;
-  }
-
-  return `+${digits}`;
-}
-
-/**
- * Read the first non-empty string among the given keys of a parsed object.
- * Returns null if none is present. Used to pull fields out of the provider
- * response defensively, without assuming its exact shape.
- */
-function readString(obj: Record<string, unknown>, keys: string[]): string | null {
-  for (const key of keys) {
-    const value = obj[key];
-    if (typeof value === "string" && value.length > 0) {
-      return value;
-    }
-  }
-  return null;
 }
 
 /**
@@ -153,77 +114,23 @@ async function sendToContact(
   };
   const params = template.params.map((key) => paramSource[key] ?? "");
 
-  const body = {
-    toPhone: phone,
-    fromPhone: FROM_PHONE,
-    organizationId: ORGANIZATION_ID,
-    templateId: template.template_id,
-    params,
-    contactName: contact.name,
-    skipReassign: false,
-  };
-
   const base = {
     contact_id: contact.contact_id,
     name: contact.name,
     phone,
   };
 
-  try {
-    const response = await fetch(API_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiToken}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-    });
+  const result = await sendTemplateMessage(
+    {
+      toPhone: phone,
+      templateId: template.template_id,
+      params,
+      contactName: contact.name,
+    },
+    apiToken,
+  );
 
-    const responseText = await response.text();
-
-    // Parse defensively: the provider may return non-JSON on some errors.
-    let obj: Record<string, unknown> | null = null;
-    try {
-      const parsed: unknown = JSON.parse(responseText);
-      if (parsed !== null && typeof parsed === "object") {
-        obj = parsed as Record<string, unknown>;
-      }
-    } catch {
-      obj = null;
-    }
-
-    const messageState = obj ? readString(obj, ["messageState", "state", "message_state"]) : null;
-    const providerMessageId = obj ? readString(obj, ["id", "messageId", "message_id"]) : null;
-    const chatId = obj ? readString(obj, ["chatId", "chat_id"]) : null;
-
-    let error: string | null = null;
-    if (!response.ok) {
-      error =
-        (obj && readString(obj, ["error", "message", "errorMessage", "title"])) ||
-        `Umbler returned HTTP ${response.status}.`;
-    }
-
-    return {
-      ...base,
-      accepted: response.ok,
-      status: response.status,
-      message_state: messageState,
-      provider_message_id: providerMessageId,
-      chat_id: chatId,
-      error,
-    };
-  } catch (error: unknown) {
-    // Never print the token; only surface the error message. Keep going.
-    return {
-      ...base,
-      accepted: false,
-      status: null,
-      message_state: null,
-      provider_message_id: null,
-      chat_id: null,
-      error: error instanceof Error ? error.message : String(error),
-    };
-  }
+  return { ...base, ...result };
 }
 
 const apiToken = requireEnv("UMBLER_TALK_API_TOKEN");
@@ -315,6 +222,10 @@ app.post("/api/dispatch", async (req: Request, res: Response) => {
   });
 });
 
+// SiteFlow: single consent-gated template message. Own secret, own payload,
+// own template — see src/siteflow.ts.
+app.post("/api/siteflow/dispatch", createSiteflowDispatchHandler(apiToken));
+
 // On Vercel the app is exported and invoked as a serverless function, so we
 // must NOT call listen(). Locally (npm run dev) there is no VERCEL env var, so
 // we start a normal HTTP server exactly as before.
@@ -323,6 +234,7 @@ if (!process.env.VERCEL) {
     console.log(`zapflow dispatch API listening on http://localhost:${PORT}`);
     console.log(`  GET  /health`);
     console.log(`  POST /api/dispatch`);
+    console.log(`  POST /api/siteflow/dispatch`);
   });
 }
 

@@ -35,6 +35,9 @@ cp .env.example .env
 | `DISPATCH_SECRET`        | Shared secret required to call the local API (see below) |
 | `PORT`                   | Port the local API listens on (default `3000`)        |
 | `MAX_CONTACTS`           | Max contacts allowed per dispatch (default `20`)      |
+| `SITEFLOW_DISPATCH_SECRET` | Shared secret for `POST /api/siteflow/dispatch` (see below) |
+| `SITEFLOW_TEMPLATE_ID`   | Umbler template ID for `siteflow_continuar_conversa`  |
+| `DRY_RUN`                | `1` simulates the SiteFlow dispatch without calling Umbler |
 
 > Keep `DISPATCH_SECRET` out of source control. The provided value
 > `change-this-secret` in `.env.example` is a placeholder — set a real secret in
@@ -179,6 +182,98 @@ curl -X POST http://localhost:3000/api/dispatch \
 
 > The Umbler token is only read from the environment and is never printed.
 
+### `POST /api/siteflow/dispatch`
+
+Server-to-server endpoint for the SiteFlow integration. Sends **one** template
+message to **one** visitor who has explicitly consented. It is completely
+separate from `/api/dispatch`: different secret, different payload, different
+template.
+
+**Authentication.** Requires the header `x-siteflow-dispatch-secret`, matched
+against `SITEFLOW_DISPATCH_SECRET`. A missing or wrong value returns `401`. If
+the variable itself is not configured the route returns `503` — the rest of the
+server, including `/api/dispatch`, keeps working.
+
+Request body:
+
+```json
+{
+  "client_id": "client-example",
+  "client_brand": "Marca Exemplo",
+  "conversation_id": "conversation-example",
+  "lead_id": "lead-example",
+  "visitor_first_name": "Ana",
+  "phone": "+5511900000000",
+  "consent": {
+    "granted": true,
+    "granted_at": "2026-07-28T14:00:00Z",
+    "source": "siteflow-web"
+  }
+}
+```
+
+| Field                 | Rule                                                     |
+| --------------------- | -------------------------------------------------------- |
+| `client_id`           | required, non-empty string                                |
+| `client_brand`        | required — template param `{{2}}`                         |
+| `conversation_id`     | required, non-empty string                                |
+| `lead_id`             | required, non-empty string                                |
+| `visitor_first_name`  | required — template param `{{1}}`                         |
+| `phone`               | required; normalized with the same Brazilian rules as `/api/dispatch` |
+| `consent.granted`     | must be exactly `true`                                    |
+| `consent.granted_at`  | required ISO-8601 date string                             |
+| `consent.source`      | required, non-empty string                                |
+
+**Template.** The logical name is `siteflow_continuar_conversa`
+(`{{1}} = visitor_first_name`, `{{2}} = client_brand`, plus the static
+"Receber resumo" quick-reply button). Params are always sent in the order
+`[visitor_first_name, client_brand]`. The provider ID comes only from
+`SITEFLOW_TEMPLATE_ID` — it is never hardcoded and never returned in a response.
+
+**Dry run.** With `DRY_RUN=1` (or `true`) the request is fully validated and
+then simulated: Umbler is never called, no WhatsApp message is sent,
+`SITEFLOW_TEMPLATE_ID` is not required, and the template does not need to be
+approved. The response carries `"dry_run": true` and
+`"message_state": "simulated"`. `DRY_RUN` affects this endpoint only —
+`/api/dispatch` ignores it.
+
+Response (dry run):
+
+```json
+{
+  "success": true,
+  "dry_run": true,
+  "client_id": "client-example",
+  "conversation_id": "conversation-example",
+  "lead_id": "lead-example",
+  "template_name": "siteflow_continuar_conversa",
+  "phone": "+5511*******00",
+  "params": ["Ana", "Marca Exemplo"],
+  "accepted": true,
+  "status": null,
+  "message_state": "simulated",
+  "provider_message_id": null,
+  "chat_id": null,
+  "delivery_status": "pending",
+  "error": null
+}
+```
+
+Errors: `400` (invalid payload or phone), `401` (bad secret), `403`
+(`Consent was not granted.`), `503` (secret or template not configured).
+
+Example call — safe, because `DRY_RUN=1` stops before any provider call:
+
+```bash
+curl -X POST http://localhost:3000/api/siteflow/dispatch \
+  -H "Content-Type: application/json" \
+  -H "x-siteflow-dispatch-secret: $SITEFLOW_DISPATCH_SECRET" \
+  --data '{"client_id":"client-example","client_brand":"Marca Exemplo","conversation_id":"conversation-example","lead_id":"lead-example","visitor_first_name":"Ana","phone":"+5511900000000","consent":{"granted":true,"granted_at":"2026-07-28T14:00:00Z","source":"siteflow-web"}}'
+```
+
+> The phone number is masked in both logs and responses — the full number is
+> never written to the console.
+
 ## Deploying to Vercel
 
 This project is deployed to **Vercel from GitHub** — push the repository to
@@ -206,6 +301,9 @@ Vercel dashboard instead (Project → Settings → Environment Variables):
 | `UMBLER_TALK_API_TOKEN` | Umbler Talk bearer token (**secret**)                   |
 | `DISPATCH_SECRET`       | Shared secret required in the `x-dispatch-secret` header |
 | `MAX_CONTACTS`          | Max contacts allowed per dispatch (e.g. `20`)           |
+| `SITEFLOW_DISPATCH_SECRET` | Shared secret for the `x-siteflow-dispatch-secret` header (**secret**) |
+| `SITEFLOW_TEMPLATE_ID`  | Umbler template ID for `siteflow_continuar_conversa`    |
+| `DRY_RUN`               | Leave **unset** in production — `1` only simulates sends |
 
 `PORT` is only used for the local server (`npm run dev`) and is **not needed on
 Vercel** — the platform handles routing, so you can leave it unset in
