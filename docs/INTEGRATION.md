@@ -463,3 +463,97 @@ that WhatsApp delivered or read the message; `delivery_status` is always
 | `503`  | `"SiteFlow template is not configured."`    | Real send attempted with `SITEFLOW_TEMPLATE_ID` unset |
 
 All errors use the same envelope as §10: `{ "success": false, "error": "..." }`.
+
+## 18. SiteFlow free-text endpoint — `POST /api/siteflow/message`
+
+Dedicated **server-to-server** endpoint that sends ONE free-text WhatsApp
+message (not a template) to a single visitor. Used only for the "Receber
+resumo" reply, **after** that visitor already received the approved template
+via `/api/siteflow/dispatch` (§17). Shares that endpoint's secret and dry-run
+behaviour; the payload and the provider call are otherwise independent, and
+`/api/siteflow/dispatch` and `/api/dispatch` are unaffected by this endpoint.
+
+```
+POST https://zapflow2-dispatcher.vercel.app/api/siteflow/message
+```
+
+### 18.1 Authentication
+
+Same header and same secret as §17.1 — `x-siteflow-dispatch-secret` must
+match `SITEFLOW_DISPATCH_SECRET`. Missing/wrong secret returns `401`; an
+unconfigured server returns `503`.
+
+### 18.2 Request
+
+```json
+{
+  "client_id": "client-example",
+  "conversation_id": "conversation-example",
+  "lead_id": "lead-example",
+  "to_phone": "+5511900000000",
+  "text": "Resumo da sua conversa..."
+}
+```
+
+| Field             | Type   | Required | Notes                                              |
+| ----------------- | ------ | -------- | --------------------------------------------------- |
+| `client_id`       | string | yes      | Your client identifier                               |
+| `conversation_id` | string | yes      | SiteFlow conversation identifier                     |
+| `lead_id`         | string | yes      | SiteFlow lead identifier                             |
+| `to_phone`        | string | yes      | Brazilian number; normalized exactly as in §7        |
+| `text`            | string | yes      | Free-text message body, max 4000 characters          |
+
+### 18.3 Dry-run mode
+
+Same rule as §17.4: with `DRY_RUN=1` (or `true`) the endpoint validates the
+request in full and then simulates the send — Umbler is never called, and the
+response contains `"dry_run": true` and `"message_state": "simulated"`.
+
+### 18.4 Successful response
+
+```json
+{
+  "success": true,
+  "dry_run": true,
+  "client_id": "client-example",
+  "conversation_id": "conversation-example",
+  "lead_id": "lead-example",
+  "phone": "+5511*******00",
+  "accepted": true,
+  "status": null,
+  "message_state": "simulated",
+  "provider_message_id": null,
+  "chat_id": null,
+  "delivery_status": "pending",
+  "error": null
+}
+```
+
+`phone` is returned **masked**, and the full number and the message text are
+never written to the server logs. As in §11, `accepted` only means Umbler
+**accepted/queued** the request — never that WhatsApp delivered or read the
+message; `delivery_status` is always `"pending"`. A provider rejection on a
+real send returns HTTP `200` with `"success": false`, `"accepted": false` and
+a populated `error`.
+
+### 18.5 Error responses
+
+| Status | `error`                                     | Cause                                            |
+| ------ | -------------------------------------------- | ------------------------------------------------ |
+| `400`  | `"<field> is required."`                     | Missing or empty required field                   |
+| `400`  | `"text must be at most 4000 characters."`    | `text` longer than the limit                      |
+| `400`  | `"Invalid phone number."`                    | Phone failed Brazilian normalization              |
+| `401`  | `"Unauthorized."`                            | Missing or wrong `x-siteflow-dispatch-secret`     |
+| `503`  | `"SiteFlow dispatch is not configured."`     | `SITEFLOW_DISPATCH_SECRET` unset on the server    |
+
+All errors use the same envelope as §10: `{ "success": false, "error": "..." }`.
+
+### 18.6 Provider call
+
+Internally this calls Umbler's free-text endpoint (`POST
+.../api/v1/messages/simplified/`), sending `toPhone`, `fromPhone`,
+`organizationId` and `message` — the same `fromPhone`/`organizationId`
+constants and the same Bearer-token mechanism as the template endpoint. As
+with `/api/dispatch` and `/api/siteflow/dispatch`, this is a **real send**
+outside dry-run — only call it with a real recipient when you actually intend
+to message them.

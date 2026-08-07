@@ -2,7 +2,7 @@ import "dotenv/config";
 import express, { type Request, type Response } from "express";
 
 import { normalizePhone } from "./phone.js";
-import { createSiteflowDispatchHandler } from "./siteflow.js";
+import { createSiteflowDispatchHandler, createSiteflowMessageHandler } from "./siteflow.js";
 import { sendTemplateMessage } from "./umbler.js";
 
 interface Contact {
@@ -226,6 +226,11 @@ app.post("/api/dispatch", async (req: Request, res: Response) => {
 // own template — see src/siteflow.ts.
 app.post("/api/siteflow/dispatch", createSiteflowDispatchHandler(apiToken));
 
+// SiteFlow: single free-text message (the "Receber resumo" reply), sent
+// after the template above. Same secret, independent payload and provider
+// call — see src/siteflow.ts.
+app.post("/api/siteflow/message", createSiteflowMessageHandler(apiToken));
+
 // On Vercel the app is exported and invoked as a serverless function, so we
 // must NOT call listen(). Locally (npm run dev) there is no VERCEL env var, so
 // we start a normal HTTP server exactly as before.
@@ -235,6 +240,7 @@ if (!process.env.VERCEL) {
     console.log(`  GET  /health`);
     console.log(`  POST /api/dispatch`);
     console.log(`  POST /api/siteflow/dispatch`);
+    console.log(`  POST /api/siteflow/message`);
   });
 }
 

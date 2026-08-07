@@ -13,7 +13,7 @@
 import { type Request, type Response } from "express";
 
 import { maskPhone, normalizePhone } from "./phone.js";
-import { sendTemplateMessage, type SendTemplateResult } from "./umbler.js";
+import { sendTemplateMessage, sendTextMessage, type SendTemplateResult } from "./umbler.js";
 
 /** Logical (Meta/Umbler) template name. Not the provider ID. */
 export const SITEFLOW_TEMPLATE_NAME = "siteflow_continuar_conversa";
@@ -192,6 +192,138 @@ export function createSiteflowDispatchHandler(apiToken: string) {
       message_state: result.message_state,
       provider_message_id: result.provider_message_id,
       chat_id: result.chat_id,
+      delivery_status: "pending",
+      error: result.error,
+    });
+  };
+}
+
+/**
+ * SiteFlow endpoint — POST /api/siteflow/message
+ *
+ * Sends ONE free-text WhatsApp message (not a template) to a single visitor.
+ * Used only for the "Receber resumo" reply, after that visitor already
+ * received the approved template via /api/siteflow/dispatch above. Shares
+ * that endpoint's secret and dry-run behaviour; the payload and provider call
+ * are otherwise independent.
+ */
+
+const MAX_MESSAGE_LENGTH = 4000;
+
+interface SiteflowMessageRequest {
+  client_id: string;
+  conversation_id: string;
+  lead_id: string;
+  to_phone: string;
+  text: string;
+}
+
+/**
+ * Validate an incoming SiteFlow free-text message payload. Returns an error
+ * message string, or null if the payload is structurally valid.
+ */
+export function validateSiteflowMessageRequest(data: unknown): string | null {
+  if (typeof data !== "object" || data === null) {
+    return "Body must be a JSON object.";
+  }
+
+  const payload = data as Partial<SiteflowMessageRequest>;
+
+  for (const field of [
+    "client_id",
+    "conversation_id",
+    "lead_id",
+    "to_phone",
+    "text",
+  ] as const) {
+    const value = payload[field];
+    if (typeof value !== "string" || value.trim() === "") {
+      return `${field} is required.`;
+    }
+  }
+
+  if ((payload.text as string).length > MAX_MESSAGE_LENGTH) {
+    return `text must be at most ${MAX_MESSAGE_LENGTH} characters.`;
+  }
+
+  return null;
+}
+
+/**
+ * Build the Express handler. The Umbler token is injected (already validated
+ * at startup) so this module never reads it itself and never logs it.
+ */
+export function createSiteflowMessageHandler(apiToken: string) {
+  return async (req: Request, res: Response): Promise<void> => {
+    // 1. The route is only available once its own secret is configured —
+    //    same secret as /api/siteflow/dispatch, same fail-closed behaviour.
+    const siteflowSecret = process.env.SITEFLOW_DISPATCH_SECRET;
+    if (!siteflowSecret || siteflowSecret.trim() === "") {
+      res.status(503).json({ success: false, error: "SiteFlow dispatch is not configured." });
+      return;
+    }
+
+    // 2. Require the shared secret header. Never leak the expected value.
+    const provided = req.header("x-siteflow-dispatch-secret");
+    if (!provided || provided !== siteflowSecret) {
+      res.status(401).json({ success: false, error: "Unauthorized." });
+      return;
+    }
+
+    // 3. Payload shape.
+    const validationError = validateSiteflowMessageRequest(req.body);
+    if (validationError) {
+      res.status(400).json({ success: false, error: validationError });
+      return;
+    }
+
+    const payload = req.body as SiteflowMessageRequest;
+
+    // 4. Same Brazilian phone rules as the template endpoint.
+    const phone = normalizePhone(payload.to_phone);
+    if (phone === null) {
+      res.status(400).json({ success: false, error: "Invalid phone number." });
+      return;
+    }
+
+    const dryRun = isDryRun();
+
+    // Never log the full phone number, the secret or the message body.
+    console.log(
+      `SiteFlow message: client=${payload.client_id} conversation=${payload.conversation_id} ` +
+        `phone=${maskPhone(phone)} dry_run=${dryRun}`,
+    );
+
+    let result: SendTemplateResult;
+
+    if (dryRun) {
+      // Simulated success: no provider call.
+      result = {
+        accepted: true,
+        status: null,
+        message_state: "simulated",
+        provider_message_id: null,
+        chat_id: null,
+        error: null,
+      };
+    } else {
+      result = await sendTextMessage({ toPhone: phone, message: payload.text }, apiToken);
+    }
+
+    res.json({
+      success: result.accepted,
+      dry_run: dryRun,
+      client_id: payload.client_id,
+      conversation_id: payload.conversation_id,
+      lead_id: payload.lead_id,
+      phone: maskPhone(phone),
+      accepted: result.accepted,
+      status: result.status,
+      message_state: result.message_state,
+      provider_message_id: result.provider_message_id,
+      chat_id: result.chat_id,
+      // "accepted" means Umbler accepted/queued the request — never that it
+      // was delivered or read. See docs/INTEGRATION.md §11 and §18.
       delivery_status: "pending",
       error: result.error,
     });
