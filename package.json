@@ -9,7 +9,8 @@
     "build": "tsc --noEmit",
     "send:test": "tsx src/send-test-template.ts",
     "send:payload": "tsx src/send-from-payload.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/**/*.test.ts"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",

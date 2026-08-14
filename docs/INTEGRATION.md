@@ -557,3 +557,100 @@ constants and the same Bearer-token mechanism as the template endpoint. As
 with `/api/dispatch` and `/api/siteflow/dispatch`, this is a **real send**
 outside dry-run — only call it with a real recipient when you actually intend
 to message them.
+
+## 19. SiteFlow media-readiness endpoint — `POST /api/siteflow/media`
+
+Dedicated **read-only** server-to-server endpoint that reports whether one
+exact inbound message's media (e.g. a WhatsApp audio) is ready for download
+yet. Built for inbound audio transcription: Umbler's webhook fires while the
+media is still processing (`File.Url` is `null`); this endpoint lets SiteFlow
+poll the same exact message afterwards. It never sends a message, never
+downloads the media bytes, and has no side effects — safe to call repeatedly
+for the same `messageId`. Independent of every other endpoint in this guide:
+own logic, no provider send call.
+
+```
+POST https://zapflow2-dispatcher.vercel.app/api/siteflow/media
+```
+
+### 19.1 Authentication
+
+Same header and same secret as §17.1/§18.1 — `x-siteflow-dispatch-secret`
+must match `SITEFLOW_DISPATCH_SECRET`. Missing/wrong secret returns `401`; an
+unconfigured server returns `503`. `DRY_RUN` does not apply here — there is
+no provider send to simulate.
+
+### 19.2 Request
+
+```json
+{ "messageId": "an4ZQL9PiM6AvyyT" }
+```
+
+| Field       | Type   | Required | Notes                                                          |
+| ----------- | ------ | -------- | ---------------------------------------------------------------|
+| `messageId` | string | yes      | Exact Umbler provider message ID. The only accepted lookup key — never a phone number, contact name, or "most recent chat". |
+
+The dispatcher always queries its own already-configured Umbler organization
+(`ORGANIZATION_ID` in `src/umbler.ts`); the caller cannot pass a different one.
+
+### 19.3 Readiness signal
+
+`MessageState` (e.g. `"Processing"`) is **not** used to decide readiness —
+measured against real production traffic, it can stay `"Processing"` long
+after `File.Url` is already populated with a working link. The only signal
+this endpoint uses is `File.Url !== null`.
+
+### 19.4 Response — media not yet ready
+
+HTTP `200`:
+
+```json
+{ "success": true, "state": "processing" }
+```
+
+### 19.5 Response — media ready
+
+HTTP `200`:
+
+```json
+{
+  "success": true,
+  "state": "ready",
+  "media": {
+    "url": "https://utalk-wamedia.s3.amazonaws.com/...mp3",
+    "contentType": "audio/mpeg",
+    "sizeBytes": 171198
+  }
+}
+```
+
+No other Umbler message/contact/chat field is ever included. The response is
+sent with `Cache-Control: no-store` and is never logged or persisted by the
+dispatcher — `media.url` is a live, directly downloadable link (no
+`Authorization` header needed to fetch it). Its expiration/lifetime has not
+been measured or documented anywhere, so make no assumption about it. Treat
+`media.url` as sensitive, transient media-location data: consume it
+immediately and do not log or persist it.
+
+### 19.6 Error responses
+
+| Status | `error`                                       | Cause                                                     |
+| ------ | ---------------------------------------------- | ---------------------------------------------------------- |
+| `400`  | `"messageId is required."`                     | Missing/empty `messageId`                                  |
+| `400`  | `"messageId must be at most 128 characters."`  | `messageId` too long                                        |
+| `400`  | `"messageId has an invalid format."`           | `messageId` contains characters outside `[A-Za-z0-9_-]`     |
+| `401`  | `"Unauthorized."`                              | Missing or wrong `x-siteflow-dispatch-secret`               |
+| `503`  | `"SiteFlow dispatch is not configured."`       | `SITEFLOW_DISPATCH_SECRET` unset on the server              |
+| `502`  | `"Message not found."`                         | Umbler returned 404 for this `messageId`                    |
+| `502`  | `"Umbler request timed out."`                  | Umbler did not respond within the bounded timeout           |
+| `502`  | `"Umbler media lookup failed."`                | Umbler returned any other non-2xx status                    |
+| `502`  | `"Umbler request failed."`                     | A network/runtime error occurred while calling Umbler       |
+| `502`  | `"Umbler returned a malformed response."`      | Umbler's response body was not parseable JSON               |
+| `502`  | `"Provider returned a non-HTTPS media URL."`   | Fail-closed: `File.Url` was not `https://`                  |
+| `502`  | `"Provider returned a malformed media URL."`   | Fail-closed: `File.Url` was not a parseable URL             |
+
+All errors use the same envelope as §10: `{ "success": false, "error": "..." }`.
+Every `502` message above is a small fixed string, never provider
+response-body text, a raw exception message, the lookup URL, or the Umbler
+token — a `502` here always means the failure was on the Umbler side of this
+read-only lookup, sanitized before it ever reaches the caller.
