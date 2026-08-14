@@ -11,6 +11,7 @@ export const FROM_PHONE = "+5521990047343";
 export const ORGANIZATION_ID = "aQDFQYsjuFhKAP11";
 export const API_URL = "https://app-utalk.umbler.com/api/v1/template-messages/simplified/";
 export const MESSAGE_API_URL = "https://app-utalk.umbler.com/api/v1/messages/simplified/";
+export const MESSAGE_LOOKUP_URL = "https://app-utalk.umbler.com/api/v1/messages/";
 
 export interface SendTemplateArgs {
   /** Destination phone, already normalized to E.164. */
@@ -116,6 +117,129 @@ export async function sendTemplateMessage(
       chat_id: null,
       error: error instanceof Error ? error.message : String(error),
     };
+  }
+}
+
+/** Bounded network timeout for the read-only message lookup below. */
+const LOOKUP_TIMEOUT_MS = 8000;
+
+export type MediaLookupState = "processing" | "ready" | "error";
+
+export interface UmblerMediaFile {
+  url: string;
+  contentType: string | null;
+  sizeBytes: number | null;
+}
+
+export interface MediaLookupResult {
+  state: MediaLookupState;
+  media: UmblerMediaFile | null;
+  error: string | null;
+}
+
+/**
+ * Look up the CURRENT server-side state of one exact Umbler message by its
+ * provider message ID (GET /v1/messages/{id}/ — read-only, never mutates
+ * the message). Used to answer "is the inbound audio's media ready yet?".
+ *
+ * `MessageState` is intentionally NOT used as the readiness signal: measured
+ * against real production traffic, it can stay "Processing" long after
+ * `File.Url` is already populated with a downloadable link. `File.Url !==
+ * null` is the only field this function treats as "ready".
+ *
+ * Never downloads the media itself, never throws — any failure (timeout,
+ * malformed response, non-2xx, or a malformed/non-HTTPS URL) is captured in
+ * the returned `error` field instead. `error` is always one of a small set
+ * of fixed, sanitized strings — never provider response-body text, never
+ * the requested lookup URL, never a raw exception message. Those are
+ * external/unbounded and could otherwise leak provider details, URLs, or
+ * identifiers into a client-facing response.
+ */
+export async function getMessageMedia(
+  messageId: string,
+  apiToken: string,
+): Promise<MediaLookupResult> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), LOOKUP_TIMEOUT_MS);
+
+  try {
+    const url = `${MESSAGE_LOOKUP_URL}${encodeURIComponent(messageId)}/?organizationId=${ORGANIZATION_ID}`;
+
+    const response = await fetch(url, {
+      headers: { Authorization: `Bearer ${apiToken}` },
+      signal: controller.signal,
+    });
+
+    const responseText = await response.text();
+
+    // Parse defensively: the provider may return non-JSON on some errors.
+    let obj: Record<string, unknown> | null = null;
+    try {
+      const parsed: unknown = JSON.parse(responseText);
+      if (parsed !== null && typeof parsed === "object") {
+        obj = parsed as Record<string, unknown>;
+      }
+    } catch {
+      obj = null;
+    }
+
+    if (response.status === 404) {
+      return { state: "error", media: null, error: "Message not found." };
+    }
+
+    if (!response.ok) {
+      // Fixed message only — never forward the provider's response body
+      // (its "title"/"error"/"message" fields are external, unbounded text).
+      return { state: "error", media: null, error: "Umbler media lookup failed." };
+    }
+
+    if (!obj) {
+      return { state: "error", media: null, error: "Umbler returned a malformed response." };
+    }
+
+    const file = obj.file;
+    if (file === null || file === undefined || typeof file !== "object") {
+      return { state: "processing", media: null, error: null };
+    }
+
+    const fileObj = file as Record<string, unknown>;
+    const rawUrl = fileObj.url;
+    if (typeof rawUrl !== "string" || rawUrl.length === 0) {
+      return { state: "processing", media: null, error: null };
+    }
+
+    // Fail closed: hand back only a well-formed HTTPS URL.
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(rawUrl);
+    } catch {
+      return { state: "error", media: null, error: "Provider returned a malformed media URL." };
+    }
+    if (parsedUrl.protocol !== "https:") {
+      return { state: "error", media: null, error: "Provider returned a non-HTTPS media URL." };
+    }
+
+    const contentType = typeof fileObj.contentType === "string" ? fileObj.contentType : null;
+    const rawSize = fileObj.originalSizeBytes;
+    const sizeBytes =
+      typeof rawSize === "number" && Number.isFinite(rawSize) && rawSize >= 0 ? rawSize : null;
+
+    return {
+      state: "ready",
+      media: { url: rawUrl, contentType, sizeBytes },
+      error: null,
+    };
+  } catch (error: unknown) {
+    // Fixed message only — never the token, never the lookup URL, and never
+    // the raw exception message (it may embed request/URL/host details).
+    const isAbort = error instanceof Error && error.name === "AbortError";
+    return {
+      state: "error",
+      media: null,
+      error: isAbort ? "Umbler request timed out." : "Umbler request failed.",
+    };
+  } finally {
+    clearTimeout(timeout);
   }
 }
 

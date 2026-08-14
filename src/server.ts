@@ -2,6 +2,7 @@ import "dotenv/config";
 import express, { type Request, type Response } from "express";
 
 import { normalizePhone } from "./phone.js";
+import { createSiteflowMediaHandler } from "./siteflow-media.js";
 import { createSiteflowDispatchHandler, createSiteflowMessageHandler } from "./siteflow.js";
 import { sendTemplateMessage } from "./umbler.js";
 
@@ -231,6 +232,11 @@ app.post("/api/siteflow/dispatch", createSiteflowDispatchHandler(apiToken));
 // call — see src/siteflow.ts.
 app.post("/api/siteflow/message", createSiteflowMessageHandler(apiToken));
 
+// SiteFlow: read-only lookup of one exact inbound message's media
+// readiness (audio transcription support). Same secret, no side effects —
+// see src/siteflow-media.ts.
+app.post("/api/siteflow/media", createSiteflowMediaHandler(apiToken));
+
 // On Vercel the app is exported and invoked as a serverless function, so we
 // must NOT call listen(). Locally (npm run dev) there is no VERCEL env var, so
 // we start a normal HTTP server exactly as before.
@@ -241,6 +247,7 @@ if (!process.env.VERCEL) {
     console.log(`  POST /api/dispatch`);
     console.log(`  POST /api/siteflow/dispatch`);
     console.log(`  POST /api/siteflow/message`);
+    console.log(`  POST /api/siteflow/media`);
   });
 }
 
