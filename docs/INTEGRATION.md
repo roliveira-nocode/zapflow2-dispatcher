@@ -364,6 +364,8 @@ endpoint returns `503` and nothing else on the server is affected.
 
 ### 17.2 Request
 
+Legacy shape — `template` omitted — is unchanged:
+
 ```json
 {
   "client_id": "client-example",
@@ -383,30 +385,49 @@ endpoint returns `503` and nothing else on the server is affected.
 | Field                | Type    | Required | Notes                                              |
 | -------------------- | ------- | -------- | -------------------------------------------------- |
 | `client_id`          | string  | yes      | Your client identifier                              |
-| `client_brand`       | string  | yes      | Template param `{{2}}`                              |
+| `client_brand`       | string  | only when `template` is omitted | Template param `{{2}}` of the legacy default |
 | `conversation_id`    | string  | yes      | SiteFlow conversation identifier                    |
 | `lead_id`            | string  | yes      | SiteFlow lead identifier                            |
-| `visitor_first_name` | string  | yes      | Template param `{{1}}`                              |
-| `phone`              | string  | yes      | Brazilian number; normalized exactly as in §7       |
-| `consent.granted`    | boolean | yes      | Must be exactly `true`, otherwise `403`             |
-| `consent.granted_at` | string  | yes      | ISO-8601 timestamp of the consent                   |
-| `consent.source`     | string  | yes      | Where consent was collected, e.g. `siteflow-web`    |
+| `visitor_first_name` | string  | yes      | Umbler contact name for every template               |
+| `phone`              | string  | yes      | Brazilian number; normalized exactly as in §7 — target of the message, not necessarily the visitor's own number (see `notificacao_interna` below) |
+| `consent`            | object  | unless the resolved template's consent rule says otherwise (see §17.3) | |
+| `consent.granted`    | boolean | when consent is required | Must be exactly `true`, otherwise `403`             |
+| `consent.granted_at` | string  | when consent is required | ISO-8601 timestamp of the consent                   |
+| `consent.source`     | string  | when consent is required | Where consent was collected, e.g. `siteflow-web`    |
+| `template`           | string  | no       | One of the closed set of logical keys in §17.3. Omitted = the legacy default |
+| `params`             | string[]| only when `template` is present | The template's params, in order, exact length required |
 
-### 17.3 Template
+### 17.3 Templates
 
-Logical name: **`siteflow_continuar_conversa`**.
+A **closed set** — a caller may only select one of the keys below via
+`template`; a raw provider template ID is never accepted from the request.
 
-| Placeholder | Value                |
-| ----------- | -------------------- |
-| `{{1}}`     | `visitor_first_name` |
-| `{{2}}`     | `client_brand`       |
+| `template` key (default marked)  | Logical (Meta/Umbler) name           | Params, in order                     | Consent required | Provider ID env var                          |
+| ---------------------------------- | -------------------------------------- | -------------------------------------- | ------------------- | ------------------------------------------------ |
+| `continuar_conversa` (**default**) | `siteflow_continuar_conversa`          | `[visitor_first_name, client_brand]`   | yes                  | `SITEFLOW_TEMPLATE_ID`                            |
+| `confirmacao_contato`              | `siteflow_confirmacao_contato`         | `[visitor_first_name]`                 | yes                  | `SITEFLOW_TEMPLATE_CONFIRMACAO_CONTATO_ID`        |
+| `notificacao_interna`              | `siteflow_nova_solicitacao_interna`    | `[visitor_name, visitor_phone]`        | **no**               | `SITEFLOW_TEMPLATE_NOTIFICACAO_INTERNA_ID`        |
 
-It also carries the static quick-reply button **"Receber resumo"**. Params are
-always sent in the order `[visitor_first_name, client_brand]`.
+`continuar_conversa` carries the static quick-reply button **"Receber
+resumo"**; `notificacao_interna` carries the static quick-reply button
+**"Ver resumo do contato"**. Neither button changes this payload — both are
+part of the template approved on Meta/Umbler, exactly like the confirmed
+button behaviour documented for the original template.
 
-The provider template ID is read from the server-only variable
-`SITEFLOW_TEMPLATE_ID`. It is never hardcoded in source, never accepted from the
-request, and never returned in a response — only the logical name is echoed back.
+**`notificacao_interna` and consent.** This is the one template with
+`requiresConsent: false`: it is never sent to the visitor (the caller
+resolves its own destination — e.g. a fixed internal number — before
+calling this endpoint; the endpoint itself never picks who receives it), so
+there is no visitor consent to require. `consent`, if present in the
+request, is simply ignored for this template — never inspected, never
+synthesized as `true`.
+
+Each template's provider ID is read from **its own** server-only variable
+(table above). It is never hardcoded in source, never accepted from the
+request, and never returned in a response — only the logical name is echoed
+back (`template_name` in the response, §17.5). A template whose env var is
+unset is unavailable **on its own** — a `503` naming it — the other two are
+unaffected (§17.6).
 
 ### 17.4 Dry-run mode
 
@@ -414,7 +435,7 @@ When the server has `DRY_RUN=1` (or `true`), the endpoint validates the request
 in full and then **simulates** the send:
 
 - Umbler is never called and no WhatsApp message is sent;
-- `SITEFLOW_TEMPLATE_ID` is not required;
+- no per-template provider ID env var is required, for any of the three templates in §17.3;
 - the template does not need to be approved;
 - the response contains `"dry_run": true` and `"message_state": "simulated"`.
 
@@ -456,11 +477,14 @@ that WhatsApp delivered or read the message; `delivery_status` is always
 | `400`  | `"<field> is required."`                    | Missing or empty required field                   |
 | `400`  | `"consent.granted must be a boolean."`      | Wrong type for `consent.granted`                  |
 | `400`  | `"consent.granted_at must be an ISO-8601 date string."` | Unparseable timestamp              |
+| `400`  | `"template is not one of the known SiteFlow templates."` | `template` is not a key in §17.3    |
+| `400`  | `"params is required and must be a non-empty array of non-empty strings."` | `template` present but `params` missing/malformed |
+| `400`  | `"params must have exactly N value(s) for template \"...\"."` | `params.length` does not match that template |
 | `400`  | `"Invalid phone number."`                   | Phone failed Brazilian normalization              |
 | `401`  | `"Unauthorized."`                           | Missing or wrong `x-siteflow-dispatch-secret`     |
-| `403`  | `"Consent was not granted."`                | `consent.granted` is not exactly `true`           |
+| `403`  | `"Consent was not granted."`                | `consent.granted` is not exactly `true` — never for `notificacao_interna` |
 | `503`  | `"SiteFlow dispatch is not configured."`    | `SITEFLOW_DISPATCH_SECRET` unset on the server    |
-| `503`  | `"SiteFlow template is not configured."`    | Real send attempted with `SITEFLOW_TEMPLATE_ID` unset |
+| `503`  | `"SiteFlow template \"<logical name>\" is not configured."` | Real send attempted with that template's env var unset — only that template is affected |
 
 All errors use the same envelope as §10: `{ "success": false, "error": "..." }`.
 

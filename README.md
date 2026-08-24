@@ -194,7 +194,7 @@ against `SITEFLOW_DISPATCH_SECRET`. A missing or wrong value returns `401`. If
 the variable itself is not configured the route returns `503` — the rest of the
 server, including `/api/dispatch`, keeps working.
 
-Request body:
+Request body (legacy — `template` omitted, exactly as before):
 
 ```json
 {
@@ -215,20 +215,42 @@ Request body:
 | Field                 | Rule                                                     |
 | --------------------- | -------------------------------------------------------- |
 | `client_id`           | required, non-empty string                                |
-| `client_brand`        | required — template param `{{2}}`                         |
+| `client_brand`        | required **only when `template` is omitted** — template param `{{2}}` of the legacy default |
 | `conversation_id`     | required, non-empty string                                |
 | `lead_id`             | required, non-empty string                                |
-| `visitor_first_name`  | required — template param `{{1}}`                         |
+| `visitor_first_name`  | always required — used as the Umbler contact name for every template |
 | `phone`               | required; normalized with the same Brazilian rules as `/api/dispatch` |
-| `consent.granted`     | must be exactly `true`                                    |
-| `consent.granted_at`  | required ISO-8601 date string                             |
-| `consent.source`      | required, non-empty string                                |
+| `consent`             | required and validated, **unless** the resolved template's `requiresConsent` is `false` (only `siteflow_nova_solicitacao_interna` today) |
+| `consent.granted`     | must be exactly `true` when consent is required           |
+| `consent.granted_at`  | required ISO-8601 date string, when consent is required   |
+| `consent.source`      | required, non-empty string, when consent is required       |
+| `template`            | optional. One of the closed set of logical keys below. Omitted = the legacy default (`continuar_conversa`) |
+| `params`              | required **when `template` is present**: an array of non-empty strings, in the template's declared order, with the exact length the template expects. Ignored when `template` is omitted (legacy params are always computed from `visitor_first_name` + `client_brand`) |
 
-**Template.** The logical name is `siteflow_continuar_conversa`
-(`{{1}} = visitor_first_name`, `{{2}} = client_brand`, plus the static
-"Receber resumo" quick-reply button). Params are always sent in the order
-`[visitor_first_name, client_brand]`. The provider ID comes only from
-`SITEFLOW_TEMPLATE_ID` — it is never hardcoded and never returned in a response.
+**Templates.** A closed set — `src/siteflow.ts`, `SITEFLOW_TEMPLATES` — the
+only thing `template` may name. A caller can never send a raw provider
+template ID.
+
+| `template` key           | Logical (Meta/Umbler) name          | Params, in order                    | Consent required | Provider ID env var                        |
+| ------------------------- | ------------------------------------ | ------------------------------------ | ------------------ | -------------------------------------------- |
+| `continuar_conversa` (default) | `siteflow_continuar_conversa`        | `[visitor_first_name, client_brand]` | yes                 | `SITEFLOW_TEMPLATE_ID`                        |
+| `confirmacao_contato`      | `siteflow_confirmacao_contato`       | `[visitor_first_name]`               | yes                 | `SITEFLOW_TEMPLATE_CONFIRMACAO_CONTATO_ID`    |
+| `notificacao_interna`      | `siteflow_nova_solicitacao_interna`  | `[visitor_name, visitor_phone]`      | **no**              | `SITEFLOW_TEMPLATE_NOTIFICACAO_INTERNA_ID`    |
+
+`continuar_conversa` also carries the static "Receber resumo" quick-reply
+button; `notificacao_interna` carries the static "Ver resumo do contato"
+quick-reply button. Neither needs any payload handling here — both live in
+the template approved on Meta/Umbler.
+
+`notificacao_interna` is the one exception to the consent gate: it is never
+sent to the visitor (the caller resolves its own destination number — e.g. a
+fixed internal number — server-side; this endpoint never picks it), so there
+is no visitor consent to check. No consent is ever synthesized for it;
+`consent`, if sent, is simply ignored.
+
+A per-template provider ID that is unset only disables **that** template —
+`503 { "error": "SiteFlow template \"<logical name>\" is not configured." }`
+— the other two keep working.
 
 **Dry run.** With `DRY_RUN=1` (or `true`) the request is fully validated and
 then simulated: Umbler is never called, no WhatsApp message is sent,
@@ -259,8 +281,10 @@ Response (dry run):
 }
 ```
 
-Errors: `400` (invalid payload or phone), `401` (bad secret), `403`
-(`Consent was not granted.`), `503` (secret or template not configured).
+Errors: `400` (invalid payload, unknown `template`, wrong `params` length, or
+invalid phone), `401` (bad secret), `403` (`Consent was not granted.` —
+never for `notificacao_interna`), `503` (secret or that template's env var
+not configured).
 
 Example call — safe, because `DRY_RUN=1` stops before any provider call:
 
@@ -303,6 +327,8 @@ Vercel dashboard instead (Project → Settings → Environment Variables):
 | `MAX_CONTACTS`          | Max contacts allowed per dispatch (e.g. `20`)           |
 | `SITEFLOW_DISPATCH_SECRET` | Shared secret for the `x-siteflow-dispatch-secret` header (**secret**) |
 | `SITEFLOW_TEMPLATE_ID`  | Umbler template ID for `siteflow_continuar_conversa`    |
+| `SITEFLOW_TEMPLATE_CONFIRMACAO_CONTATO_ID` | Umbler template ID for `siteflow_confirmacao_contato` |
+| `SITEFLOW_TEMPLATE_NOTIFICACAO_INTERNA_ID` | Umbler template ID for `siteflow_nova_solicitacao_interna` |
 | `DRY_RUN`               | Leave **unset** in production — `1` only simulates sends |
 
 `PORT` is only used for the local server (`npm run dev`) and is **not needed on
