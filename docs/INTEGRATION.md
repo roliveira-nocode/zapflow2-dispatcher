@@ -414,6 +414,17 @@ A **closed set** — a caller may only select one of the keys below via
 | `continuar_conversa` (**default**) | `siteflow_continuar_conversa`          | `[visitor_first_name, client_brand]`   | yes                  | `SITEFLOW_TEMPLATE_ID`                            |
 | `confirmacao_contato`              | `siteflow_confirmacao_contato`         | `[visitor_first_name]`                 | yes                  | `SITEFLOW_TEMPLATE_CONFIRMACAO_CONTATO_ID`        |
 | `notificacao_interna`              | `siteflow_nova_solicitacao_interna`    | `[visitor_name, visitor_phone]`        | **no**               | `SITEFLOW_TEMPLATE_NOTIFICACAO_INTERNA_ID`        |
+| `camp_primeiro_contato`            | `camp_primeiro_contato`                | `[first_name, contextual_message]`     | yes                  | `SITEFLOW_TEMPLATE_CAMP_PRIMEIRO_CONTATO_ID`      |
+| `camp_reativacao_comercial`        | `camp_reativacao_comercial`            | `[first_name, contextual_reason]`      | yes                  | `SITEFLOW_TEMPLATE_CAMP_REATIVACAO_COMERCIAL_ID`  |
+| `camp_convite_comercial`           | `camp_convite_comercial`               | `[first_name, contextual_invitation]`  | yes                  | `SITEFLOW_TEMPLATE_CAMP_CONVITE_COMERCIAL_ID`     |
+| `compartilhar_link_contextual`     | `compartilhar_link_contextual`         | `[first_name, contextual_reason, link]`| yes                  | `SITEFLOW_TEMPLATE_COMPARTILHAR_LINK_CONTEXTUAL_ID` |
+
+**The last four are the approved CAMPAIGN templates.** They are registered, not
+activated: the dispatcher knows they exist and how many params they take, and
+nothing more. Each stays unsendable until its own env var is set, and each
+requires explicit granted `consent` exactly like any other visitor-facing
+template — `notificacao_interna` remains the one and only consent exception.
+Use §20 to check whether one is dispatchable before you rely on it.
 
 `continuar_conversa` carries the static quick-reply button **"Receber
 resumo"**; `notificacao_interna` carries the static quick-reply button
@@ -802,3 +813,135 @@ Every `502` message above is a small fixed string, never provider
 response-body text, a raw exception message, the lookup URL, or the Umbler
 token — a `502` here always means the failure was on the Umbler side of this
 read-only lookup, sanitized before it ever reaches the caller.
+
+## 20. SiteFlow preflight endpoint — `POST /api/siteflow/preflight`
+
+Answers one question, and **sends nothing**:
+
+> Given this logical template key and this many params, is the dispatcher
+> configured to send it?
+
+Built for campaign preparation: you need to know a template is dispatchable
+*before* a run starts, and the only other way to find out is to attempt a real
+send. This endpoint closes that gap without ever reaching the provider. It has
+no side effects — calling it a hundred times is identical to calling it once.
+
+```
+POST https://zapflow2-dispatcher.vercel.app/api/siteflow/preflight
+```
+
+### 20.1 Authentication
+
+Same header and same secret as §17.1/§18.1/§19.1 — `x-siteflow-dispatch-secret`
+must match `SITEFLOW_DISPATCH_SECRET`. Missing or wrong returns `401`; an
+unconfigured server returns `503`.
+
+### 20.2 Request
+
+```json
+{ "template": "camp_primeiro_contato", "params_count": 2 }
+```
+
+| Field          | Type   | Required | Notes                                                             |
+| -------------- | ------ | -------- | ----------------------------------------------------------------- |
+| `template`     | string | yes      | A logical key from §17.3. A raw provider template ID is never accepted and never resolves |
+| `params_count` | number | yes      | A non-negative integer: how many params you intend to send         |
+
+The **count only** — preflight deliberately does not accept the params
+themselves. It has no use for names, personalized copy or links, and accepting
+them would suggest it validated their content. It did not.
+
+### 20.3 What it checks, in order
+
+1. `SITEFLOW_DISPATCH_SECRET` is configured;
+2. the request is authenticated;
+3. the body shape is valid;
+4. `template` is a key of the closed registry in §17.3;
+5. `params_count` matches that template's registered arity;
+6. that template's provider-ID env var is set.
+
+### 20.4 What it does NOT check
+
+Recipient **consent** (that belongs to SiteFlow — see §17.3 and the consent
+rules in §17.2), the **content** of your params, the phone number, or any
+campaign state. A `ready: true` means "the dispatcher is configured to send
+this template with this many params" and nothing more.
+
+### 20.5 Response — ready
+
+HTTP `200`:
+
+```json
+{
+  "success": true,
+  "ready": true,
+  "template": "camp_primeiro_contato",
+  "expected_params": 2,
+  "provider_attempted": false,
+  "failure_stage": "none"
+}
+```
+
+### 20.6 Response — not ready
+
+```json
+{
+  "success": false,
+  "ready": false,
+  "code": "PARAMS_COUNT_MISMATCH",
+  "error": "params must have exactly 2 value(s) for template \"camp_primeiro_contato\".",
+  "template": "camp_primeiro_contato",
+  "expected_params": 2,
+  "provider_attempted": false,
+  "failure_stage": "request_validation"
+}
+```
+
+`template` echoes the logical key you sent; `expected_params` is the registry's
+authoritative arity, so a mismatch tells you the right number. Both appear only
+once the key has resolved. `success` and `ready` are always equal — `success`
+keeps the envelope of §10, `ready` is the answer to act on.
+
+| `code` | Status | `error` | `failure_stage` |
+| ------ | ------ | ------- | --------------- |
+| `DISPATCH_NOT_CONFIGURED` | `503` | `"SiteFlow dispatch is not configured."` | `configuration` |
+| `UNAUTHORIZED` | `401` | `"Unauthorized."` | `request_validation` |
+| `INVALID_REQUEST` | `400` | `"Body must be a JSON object."` / `"template is required."` / `"params_count must be a non-negative integer."` | `request_validation` |
+| `UNKNOWN_TEMPLATE` | `400` | `"template is not one of the known SiteFlow templates."` | `request_validation` |
+| `PARAMS_COUNT_MISMATCH` | `400` | `"params must have exactly N value(s) for template \"...\"."` | `request_validation` |
+| `TEMPLATE_NOT_CONFIGURED` | `503` | `"SiteFlow template \"<logical name>\" is not configured."` | `configuration` |
+| `UNEXPECTED_ERROR` | `500` | `"Unexpected dispatcher error."` | `pre_provider_error` |
+
+`code` is stable and machine-readable — branch on it, not on `error`. It is
+present on failures only.
+
+### 20.7 Zero-send guarantee
+
+Preflight never calls the provider, on any path, success or failure. Three
+independent layers hold that up:
+
+- the module does not import the provider transport at all, so it has nothing
+  to call;
+- its handler is built **without** the Umbler API token — unlike every other
+  SiteFlow route it is never handed one, so it could not authenticate to the
+  provider even if it tried;
+- its Slice 4 metadata is only ever constructed from the "not attempted"
+  constants.
+
+Consequently **every** preflight response carries `"provider_attempted": false`,
+and `failure_stage` is never `provider_rejected` or `provider_indeterminate`.
+Per §17.7 that is the one value which proves no provider request was
+initiated — for this endpoint it is guaranteed rather than merely observed.
+
+### 20.8 `DRY_RUN` does not apply
+
+Unlike §17.4, `DRY_RUN` is deliberately **ignored** here. The dispatch route
+lets `DRY_RUN` skip the provider-ID check; preflight must not, or it would
+report `ready: true` for a template that cannot actually be sent. Preflight
+always answers "can a **real** send be made".
+
+### 20.9 Secrets
+
+No response ever contains a provider template ID, the Umbler token, the
+dispatch secret, or any environment value. Only the logical key and the
+expected param count ever come back.

@@ -18,16 +18,19 @@ const ENV_KEYS = [
   "SITEFLOW_TEMPLATE_ID",
   "SITEFLOW_TEMPLATE_CONFIRMACAO_CONTATO_ID",
   "SITEFLOW_TEMPLATE_NOTIFICACAO_INTERNA_ID",
+  "SITEFLOW_TEMPLATE_CAMP_PRIMEIRO_CONTATO_ID",
+  "SITEFLOW_TEMPLATE_CAMP_REATIVACAO_COMERCIAL_ID",
+  "SITEFLOW_TEMPLATE_CAMP_CONVITE_COMERCIAL_ID",
+  "SITEFLOW_TEMPLATE_COMPARTILHAR_LINK_CONTEXTUAL_ID",
 ] as const;
 const savedEnv = new Map<string, string | undefined>();
 
 beforeEach(() => {
   for (const key of ENV_KEYS) savedEnv.set(key, process.env[key]);
+  // Clear every managed key, then set only the secret. Adding a template to
+  // ENV_KEYS is now enough to keep it isolated between tests.
+  for (const key of ENV_KEYS) delete process.env[key];
   process.env.SITEFLOW_DISPATCH_SECRET = SECRET;
-  delete process.env.DRY_RUN;
-  delete process.env.SITEFLOW_TEMPLATE_ID;
-  delete process.env.SITEFLOW_TEMPLATE_CONFIRMACAO_CONTATO_ID;
-  delete process.env.SITEFLOW_TEMPLATE_NOTIFICACAO_INTERNA_ID;
 });
 
 afterEach(() => {
@@ -391,12 +394,23 @@ test("dry-run: any of the three templates simulate without calling the provider 
 // or by a raw provider id: SITEFLOW_TEMPLATES is the only source.
 // ---------------------------------------------------------------------
 
-test("SITEFLOW_TEMPLATES is a closed set of exactly the three approved templates", () => {
+test("SITEFLOW_TEMPLATES is a closed set of exactly the seven approved templates", () => {
   assert.deepEqual(Object.keys(SITEFLOW_TEMPLATES).sort(), [
+    "camp_convite_comercial",
+    "camp_primeiro_contato",
+    "camp_reativacao_comercial",
+    "compartilhar_link_contextual",
     "confirmacao_contato",
     "continuar_conversa",
     "notificacao_interna",
   ]);
+  assert.equal(SITEFLOW_TEMPLATES.camp_primeiro_contato.logicalName, "camp_primeiro_contato");
+  assert.equal(SITEFLOW_TEMPLATES.camp_reativacao_comercial.logicalName, "camp_reativacao_comercial");
+  assert.equal(SITEFLOW_TEMPLATES.camp_convite_comercial.logicalName, "camp_convite_comercial");
+  assert.equal(
+    SITEFLOW_TEMPLATES.compartilhar_link_contextual.logicalName,
+    "compartilhar_link_contextual",
+  );
   assert.equal(SITEFLOW_TEMPLATES.continuar_conversa.logicalName, "siteflow_continuar_conversa");
   assert.equal(SITEFLOW_TEMPLATES.confirmacao_contato.logicalName, "siteflow_confirmacao_contato");
   assert.equal(SITEFLOW_TEMPLATES.notificacao_interna.logicalName, "siteflow_nova_solicitacao_interna");
@@ -855,4 +869,231 @@ test("INVARIANT: every SiteFlow send response carries both metadata fields", asy
     assert.equal(typeof body.provider_attempted, "boolean");
     assert.equal(typeof body.failure_stage, "string");
   }
+});
+
+// =====================================================================
+// Slice 5 — the four approved campaign templates in the closed registry.
+//
+// Registering them teaches the dispatcher that they exist and how many
+// params they take. It activates nothing: each stays unsendable until its
+// own env var is set, and each requires explicit granted consent exactly
+// like any other visitor-facing template.
+// =====================================================================
+
+/** Fake provider IDs. A real approved ID must never be committed. */
+const CAMPAIGN_ENTRIES = [
+  {
+    key: "camp_primeiro_contato",
+    envVar: "SITEFLOW_TEMPLATE_CAMP_PRIMEIRO_CONTATO_ID",
+    fakeProviderId: "fake-provider-id-primeiro-contato",
+    params: ["Maria", "mensagem contextual personalizada"],
+  },
+  {
+    key: "camp_reativacao_comercial",
+    envVar: "SITEFLOW_TEMPLATE_CAMP_REATIVACAO_COMERCIAL_ID",
+    fakeProviderId: "fake-provider-id-reativacao",
+    params: ["Maria", "motivo contextual personalizado"],
+  },
+  {
+    key: "camp_convite_comercial",
+    envVar: "SITEFLOW_TEMPLATE_CAMP_CONVITE_COMERCIAL_ID",
+    fakeProviderId: "fake-provider-id-convite",
+    params: ["Maria", "convite contextual personalizado"],
+  },
+  {
+    key: "compartilhar_link_contextual",
+    envVar: "SITEFLOW_TEMPLATE_COMPARTILHAR_LINK_CONTEXTUAL_ID",
+    fakeProviderId: "fake-provider-id-link-contextual",
+    params: ["Maria", "motivo contextual personalizado", "https://example.test/recurso"],
+  },
+] as const;
+
+// ---------------------------------------------------------------------
+// Registry shape
+// ---------------------------------------------------------------------
+
+test("slice 5: the three pre-existing entries are untouched", () => {
+  assert.deepEqual(
+    { ...SITEFLOW_TEMPLATES.continuar_conversa, paramOrder: [...SITEFLOW_TEMPLATES.continuar_conversa.paramOrder] },
+    {
+      logicalName: "siteflow_continuar_conversa",
+      envVar: "SITEFLOW_TEMPLATE_ID",
+      paramOrder: ["visitor_first_name", "client_brand"],
+      requiresConsent: true,
+    },
+  );
+  assert.deepEqual(
+    { ...SITEFLOW_TEMPLATES.confirmacao_contato, paramOrder: [...SITEFLOW_TEMPLATES.confirmacao_contato.paramOrder] },
+    {
+      logicalName: "siteflow_confirmacao_contato",
+      envVar: "SITEFLOW_TEMPLATE_CONFIRMACAO_CONTATO_ID",
+      paramOrder: ["visitor_first_name"],
+      requiresConsent: true,
+    },
+  );
+  assert.deepEqual(
+    { ...SITEFLOW_TEMPLATES.notificacao_interna, paramOrder: [...SITEFLOW_TEMPLATES.notificacao_interna.paramOrder] },
+    {
+      logicalName: "siteflow_nova_solicitacao_interna",
+      envVar: "SITEFLOW_TEMPLATE_NOTIFICACAO_INTERNA_ID",
+      paramOrder: ["visitor_name", "visitor_phone"],
+      requiresConsent: false,
+    },
+  );
+});
+
+test("slice 5: each campaign entry has its own env var, arity and consent flag", () => {
+  const expectedArity: Record<string, number> = {
+    camp_primeiro_contato: 2,
+    camp_reativacao_comercial: 2,
+    camp_convite_comercial: 2,
+    compartilhar_link_contextual: 3,
+  };
+
+  for (const entry of CAMPAIGN_ENTRIES) {
+    const spec = SITEFLOW_TEMPLATES[entry.key];
+    assert.equal(spec.logicalName, entry.key, `${entry.key}: logicalName`);
+    assert.equal(spec.envVar, entry.envVar, `${entry.key}: envVar`);
+    assert.equal(spec.paramOrder.length, expectedArity[entry.key], `${entry.key}: arity`);
+    // Fail-closed: true means /api/siteflow/dispatch REFUSES without granted
+    // consent. It is not a consent grant. notificacao_interna stays the one
+    // and only exception in the registry.
+    assert.equal(spec.requiresConsent, true, `${entry.key}: requiresConsent`);
+  }
+
+  const withoutConsent = Object.entries(SITEFLOW_TEMPLATES)
+    .filter(([, spec]) => spec.requiresConsent === false)
+    .map(([key]) => key);
+  assert.deepEqual(withoutConsent, ["notificacao_interna"]);
+});
+
+test("slice 5: no provider template ID is hardcoded in the registry", () => {
+  for (const spec of Object.values(SITEFLOW_TEMPLATES)) {
+    // Every entry points at an env var and carries no ID of its own.
+    assert.match(spec.envVar, /^SITEFLOW_TEMPLATE_[A-Z0-9_]*ID$/);
+    assert.equal(Object.keys(spec).sort().join(","), "envVar,logicalName,paramOrder,requiresConsent");
+  }
+});
+
+// ---------------------------------------------------------------------
+// Campaign templates through the existing dispatch route
+// ---------------------------------------------------------------------
+
+test("slice 5: a campaign template is validated for arity like any other", () => {
+  for (const entry of CAMPAIGN_ENTRIES) {
+    const ok = validateSiteflowRequest(legacyBody({ template: entry.key, params: [...entry.params] }));
+    assert.equal(typeof ok, "object", entry.key);
+
+    const tooFew = validateSiteflowRequest(
+      legacyBody({ template: entry.key, params: entry.params.slice(0, entry.params.length - 1) }),
+    );
+    assert.match(String(tooFew), /params must have exactly/, `${entry.key}: too few`);
+
+    const tooMany = validateSiteflowRequest(
+      legacyBody({ template: entry.key, params: [...entry.params, "extra"] }),
+    );
+    assert.match(String(tooMany), /params must have exactly/, `${entry.key}: too many`);
+  }
+});
+
+test("slice 5: a campaign template without granted consent is refused, provider never called", async () => {
+  for (const entry of CAMPAIGN_ENTRIES) {
+    process.env[entry.envVar] = entry.fakeProviderId;
+    const fetchCalls = blockFetch();
+
+    const denied = await runDispatch(
+      legacyBody({
+        template: entry.key,
+        params: [...entry.params],
+        consent: { granted: false, granted_at: NOW, source: "siteflow-web" },
+      }),
+    );
+    assert.equal(denied.statusCode, 403, entry.key);
+    assert.equal((denied.body as Record<string, unknown>).error, "Consent was not granted.");
+
+    const missing = legacyBody({ template: entry.key, params: [...entry.params] });
+    delete missing.consent;
+    const noConsent = await runDispatch(missing);
+    assert.equal(noConsent.statusCode, 400, entry.key);
+    assert.match(String((noConsent.body as Record<string, unknown>).error), /consent is required/);
+
+    assert.equal(fetchCalls.calls, 0, `${entry.key}: provider must not be called`);
+  }
+});
+
+test("slice 5: a campaign template whose env var is unset -> 503 naming only that template", async () => {
+  // Configure every campaign template except the first.
+  for (const entry of CAMPAIGN_ENTRIES.slice(1)) process.env[entry.envVar] = entry.fakeProviderId;
+  const target = CAMPAIGN_ENTRIES[0];
+  const fetchCalls = blockFetch();
+
+  const res = await runDispatch(legacyBody({ template: target.key, params: [...target.params] }));
+  assert.equal(res.statusCode, 503);
+  assert.equal(
+    (res.body as Record<string, unknown>).error,
+    `SiteFlow template "${target.key}" is not configured.`,
+  );
+  assert.equal(fetchCalls.calls, 0);
+
+  // A sibling campaign template is unaffected.
+  mockFetchOk({ id: "wamid.sibling" });
+  const sibling = CAMPAIGN_ENTRIES[1];
+  const ok = await runDispatch(legacyBody({ template: sibling.key, params: [...sibling.params] }));
+  assert.equal(ok.statusCode, 200);
+  assert.equal((ok.body as Record<string, unknown>).success, true);
+});
+
+test("slice 5: a configured campaign template sends with its own provider ID and params", async () => {
+  for (const entry of CAMPAIGN_ENTRIES) {
+    process.env[entry.envVar] = entry.fakeProviderId;
+    const { calls } = mockFetchOk({ id: "wamid.camp", chatId: "chat-camp" });
+
+    const res = await runDispatch(legacyBody({ template: entry.key, params: [...entry.params] }));
+
+    assert.equal(res.statusCode, 200, entry.key);
+    const body = res.body as Record<string, unknown>;
+    assert.equal(body.success, true, entry.key);
+    assert.equal(body.template_name, entry.key, entry.key);
+    assert.deepEqual(body.params, [...entry.params], entry.key);
+    // Slice 4 metadata still behaves: a real send is an attempted one.
+    assert.equal(body.provider_attempted, true, entry.key);
+    assert.equal(body.failure_stage, "none", entry.key);
+
+    const sent = JSON.parse((calls[0] as { body: string }).body);
+    assert.equal(sent.templateId, entry.fakeProviderId, entry.key);
+    assert.deepEqual(sent.params, [...entry.params], entry.key);
+    assert.equal(sent.contactName, "Maria", entry.key);
+
+    // The provider ID is never echoed back to the caller.
+    assert.equal(JSON.stringify(res.body).includes(entry.fakeProviderId), false, entry.key);
+  }
+});
+
+test("slice 5: dry-run simulates a campaign template without its env var or the provider", async () => {
+  process.env.DRY_RUN = "true";
+  const fetchCalls = blockFetch();
+
+  for (const entry of CAMPAIGN_ENTRIES) {
+    const res = await runDispatch(legacyBody({ template: entry.key, params: [...entry.params] }));
+    assert.equal(res.statusCode, 200, entry.key);
+    const body = res.body as Record<string, unknown>;
+    assert.equal(body.dry_run, true, entry.key);
+    assert.equal(body.message_state, "simulated", entry.key);
+    assert.equal(body.provider_attempted, false, entry.key);
+  }
+  assert.equal(fetchCalls.calls, 0);
+});
+
+test("slice 5: a raw provider-ID-shaped string is still rejected as a template key", async () => {
+  const fetchCalls = blockFetch();
+  for (const candidate of ["aoi-FAKE-PROVIDER-ID", "fake-provider-id-convite"]) {
+    const res = await runDispatch(legacyBody({ template: candidate, params: ["a", "b"] }));
+    assert.equal(res.statusCode, 400, candidate);
+    assert.match(
+      String((res.body as Record<string, unknown>).error),
+      /not one of the known SiteFlow templates/,
+      candidate,
+    );
+  }
+  assert.equal(fetchCalls.calls, 0);
 });
