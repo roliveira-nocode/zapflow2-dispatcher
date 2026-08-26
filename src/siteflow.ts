@@ -12,6 +12,13 @@
  */
 import { type Request, type Response } from "express";
 
+import {
+  ATTEMPTED_INDETERMINATE,
+  NOT_ATTEMPTED_CONFIGURATION,
+  NOT_ATTEMPTED_OK,
+  NOT_ATTEMPTED_PRE_PROVIDER_ERROR,
+  NOT_ATTEMPTED_VALIDATION,
+} from "./dispatch-outcome.js";
 import { maskPhone, normalizePhone } from "./phone.js";
 import { sendTemplateMessage, sendTextMessage, type SendTemplateResult } from "./umbler.js";
 
@@ -184,107 +191,156 @@ export function validateSiteflowRequest(data: unknown): string | ValidatedSitefl
  */
 export function createSiteflowDispatchHandler(apiToken: string) {
   return async (req: Request, res: Response): Promise<void> => {
-    // 1. The route is only available once its own secret is configured. Kept
-    //    out of the startup checks so a missing value cannot stop the server
-    //    (and /api/dispatch) from booting.
-    const siteflowSecret = process.env.SITEFLOW_DISPATCH_SECRET;
-    if (!siteflowSecret || siteflowSecret.trim() === "") {
-      res.status(503).json({ success: false, error: "SiteFlow dispatch is not configured." });
-      return;
-    }
+    // Mirrors the provider-attempt boundary in src/umbler.ts. Flipped to true
+    // on the statement immediately before the send call and never reset:
+    // setting it early can only over-report "attempted", which is the
+    // fail-closed direction. Only a literal false proves no provider attempt.
+    let providerAttempted = false;
 
-    // 2. Require the shared secret header. Never leak the expected value.
-    const provided = req.header("x-siteflow-dispatch-secret");
-    if (!provided || provided !== siteflowSecret) {
-      res.status(401).json({ success: false, error: "Unauthorized." });
-      return;
-    }
-
-    // 3. Payload shape + template resolution.
-    const validated = validateSiteflowRequest(req.body);
-    if (typeof validated === "string") {
-      res.status(400).json({ success: false, error: validated });
-      return;
-    }
-    const { payload, spec, params } = validated;
-
-    // 4. Consent must be explicitly granted — nothing else counts. Skipped
-    //    entirely for a template with requiresConsent === false (only the
-    //    internal notification today): there is no visitor consent to check,
-    //    and none is ever synthesized.
-    if (spec.requiresConsent && payload.consent?.granted !== true) {
-      res.status(403).json({ success: false, error: "Consent was not granted." });
-      return;
-    }
-
-    // 5. Same Brazilian phone rules as the campaign dispatcher, for every
-    //    template — including the internal one, whose target is a fixed
-    //    company number, not the visitor's.
-    const phone = normalizePhone(payload.phone);
-    if (phone === null) {
-      res.status(400).json({ success: false, error: "Invalid phone number." });
-      return;
-    }
-
-    const dryRun = isDryRun();
-
-    // Never log the full phone number, the secret or the template ID.
-    console.log(
-      `SiteFlow dispatch: client=${payload.client_id} conversation=${payload.conversation_id} ` +
-        `template=${spec.logicalName} phone=${maskPhone(phone)} dry_run=${dryRun}`,
-    );
-
-    let result: SendTemplateResult;
-
-    if (dryRun) {
-      // Simulated success: no provider call, no approved template required, no
-      // provider template ID required.
-      result = {
-        accepted: true,
-        status: null,
-        message_state: "simulated",
-        provider_message_id: null,
-        chat_id: null,
-        error: null,
-      };
-    } else {
-      // 6. Real sends need THIS template's provider ID from the environment.
-      //    A template whose env var is unset is unavailable on its own —
-      //    the other templates are unaffected.
-      const templateId = process.env[spec.envVar];
-      if (!templateId || templateId.trim() === "") {
-        res.status(503).json({ success: false, error: `SiteFlow template "${spec.logicalName}" is not configured.` });
+    try {
+      // 1. The route is only available once its own secret is configured. Kept
+      //    out of the startup checks so a missing value cannot stop the server
+      //    (and /api/dispatch) from booting.
+      const siteflowSecret = process.env.SITEFLOW_DISPATCH_SECRET;
+      if (!siteflowSecret || siteflowSecret.trim() === "") {
+        res.status(503).json({
+          success: false,
+          error: "SiteFlow dispatch is not configured.",
+          ...NOT_ATTEMPTED_CONFIGURATION,
+        });
         return;
       }
 
-      result = await sendTemplateMessage(
-        {
-          toPhone: phone,
-          templateId,
-          params,
-          contactName: payload.visitor_first_name,
-        },
-        apiToken,
-      );
-    }
+      // 2. Require the shared secret header. Never leak the expected value.
+      const provided = req.header("x-siteflow-dispatch-secret");
+      if (!provided || provided !== siteflowSecret) {
+        res.status(401).json({
+          success: false,
+          error: "Unauthorized.",
+          ...NOT_ATTEMPTED_VALIDATION,
+        });
+        return;
+      }
 
-    res.json({
-      success: result.accepted,
-      dry_run: dryRun,
-      client_id: payload.client_id,
-      conversation_id: payload.conversation_id,
-      lead_id: payload.lead_id,
-      template_name: spec.logicalName,
-      phone: maskPhone(phone),
-      params,
-      accepted: result.accepted,
-      status: result.status,
-      message_state: result.message_state,
-      provider_message_id: result.provider_message_id,
-      chat_id: result.chat_id,
-      delivery_status: "pending",
-      error: result.error,
-    });
+      // 3. Payload shape + template resolution.
+      const validated = validateSiteflowRequest(req.body);
+      if (typeof validated === "string") {
+        res.status(400).json({ success: false, error: validated, ...NOT_ATTEMPTED_VALIDATION });
+        return;
+      }
+      const { payload, spec, params } = validated;
+
+      // 4. Consent must be explicitly granted — nothing else counts. Skipped
+      //    entirely for a template with requiresConsent === false (only the
+      //    internal notification today): there is no visitor consent to check,
+      //    and none is ever synthesized.
+      if (spec.requiresConsent && payload.consent?.granted !== true) {
+        res.status(403).json({
+          success: false,
+          error: "Consent was not granted.",
+          ...NOT_ATTEMPTED_VALIDATION,
+        });
+        return;
+      }
+
+      // 5. Same Brazilian phone rules as the campaign dispatcher, for every
+      //    template — including the internal one, whose target is a fixed
+      //    company number, not the visitor's.
+      const phone = normalizePhone(payload.phone);
+      if (phone === null) {
+        res.status(400).json({
+          success: false,
+          error: "Invalid phone number.",
+          ...NOT_ATTEMPTED_VALIDATION,
+        });
+        return;
+      }
+
+      const dryRun = isDryRun();
+
+      // Never log the full phone number, the secret or the template ID.
+      console.log(
+        `SiteFlow dispatch: client=${payload.client_id} conversation=${payload.conversation_id} ` +
+          `template=${spec.logicalName} phone=${maskPhone(phone)} dry_run=${dryRun}`,
+      );
+
+      let result: SendTemplateResult;
+
+      if (dryRun) {
+        // Simulated success: no provider call, no approved template required, no
+        // provider template ID required. provider_attempted is false because
+        // nothing was ever sent — the one success that is a proven non-send.
+        result = {
+          accepted: true,
+          status: null,
+          message_state: "simulated",
+          provider_message_id: null,
+          chat_id: null,
+          error: null,
+          ...NOT_ATTEMPTED_OK,
+        };
+      } else {
+        // 6. Real sends need THIS template's provider ID from the environment.
+        //    A template whose env var is unset is unavailable on its own —
+        //    the other templates are unaffected.
+        const templateId = process.env[spec.envVar];
+        if (!templateId || templateId.trim() === "") {
+          res.status(503).json({
+            success: false,
+            error: `SiteFlow template "${spec.logicalName}" is not configured.`,
+            ...NOT_ATTEMPTED_CONFIGURATION,
+          });
+          return;
+        }
+
+        // PROVIDER-ATTEMPT BOUNDARY. Everything above is local work; from the
+        // next statement on, a request may already have reached Umbler.
+        providerAttempted = true;
+        result = await sendTemplateMessage(
+          {
+            toPhone: phone,
+            templateId,
+            params,
+            contactName: payload.visitor_first_name,
+          },
+          apiToken,
+        );
+      }
+
+      res.json({
+        success: result.accepted,
+        dry_run: dryRun,
+        client_id: payload.client_id,
+        conversation_id: payload.conversation_id,
+        lead_id: payload.lead_id,
+        template_name: spec.logicalName,
+        phone: maskPhone(phone),
+        params,
+        accepted: result.accepted,
+        status: result.status,
+        message_state: result.message_state,
+        provider_message_id: result.provider_message_id,
+        chat_id: result.chat_id,
+        delivery_status: "pending",
+        error: result.error,
+        provider_attempted: result.provider_attempted,
+        failure_stage: result.failure_stage,
+      });
+    } catch (unexpected: unknown) {
+      // Sanitized exactly like getMessageMedia: the raw message may embed
+      // request/URL/host details, so it is logged server-side and never
+      // returned. The metadata is the point — an exception raised once the
+      // provider call is under way can never be a proven non-send.
+      console.error("SiteFlow dispatch: unexpected error.", unexpected);
+      if (res.headersSent) {
+        return;
+      }
+      res.status(500).json({
+        success: false,
+        error: "Unexpected dispatcher error.",
+        ...(providerAttempted ? ATTEMPTED_INDETERMINATE : NOT_ATTEMPTED_PRE_PROVIDER_ERROR),
+      });
+    }
   };
 }
 
@@ -358,77 +414,119 @@ export function validateSiteflowMessageRequest(data: unknown): string | null {
  */
 export function createSiteflowMessageHandler(apiToken: string) {
   return async (req: Request, res: Response): Promise<void> => {
-    // 1. The route is only available once its own secret is configured —
-    //    same secret as /api/siteflow/dispatch, same fail-closed behaviour.
-    const siteflowSecret = process.env.SITEFLOW_DISPATCH_SECRET;
-    if (!siteflowSecret || siteflowSecret.trim() === "") {
-      res.status(503).json({ success: false, error: "SiteFlow dispatch is not configured." });
-      return;
+    // Same provider-attempt boundary discipline as the template handler
+    // above: only a literal false may ever prove no provider attempt.
+    let providerAttempted = false;
+
+    try {
+      // 1. The route is only available once its own secret is configured —
+      //    same secret as /api/siteflow/dispatch, same fail-closed behaviour.
+      const siteflowSecret = process.env.SITEFLOW_DISPATCH_SECRET;
+      if (!siteflowSecret || siteflowSecret.trim() === "") {
+        res.status(503).json({
+          success: false,
+          error: "SiteFlow dispatch is not configured.",
+          ...NOT_ATTEMPTED_CONFIGURATION,
+        });
+        return;
+      }
+
+      // 2. Require the shared secret header. Never leak the expected value.
+      const provided = req.header("x-siteflow-dispatch-secret");
+      if (!provided || provided !== siteflowSecret) {
+        res.status(401).json({
+          success: false,
+          error: "Unauthorized.",
+          ...NOT_ATTEMPTED_VALIDATION,
+        });
+        return;
+      }
+
+      // 3. Payload shape.
+      const validationError = validateSiteflowMessageRequest(req.body);
+      if (validationError) {
+        res.status(400).json({
+          success: false,
+          error: validationError,
+          ...NOT_ATTEMPTED_VALIDATION,
+        });
+        return;
+      }
+
+      const payload = req.body as SiteflowMessageRequest;
+
+      // 4. Same Brazilian phone rules as the template endpoint.
+      const phone = normalizePhone(payload.to_phone);
+      if (phone === null) {
+        res.status(400).json({
+          success: false,
+          error: "Invalid phone number.",
+          ...NOT_ATTEMPTED_VALIDATION,
+        });
+        return;
+      }
+
+      const dryRun = isDryRun();
+
+      // Never log the full phone number, the secret or the message body.
+      console.log(
+        `SiteFlow message: client=${payload.client_id} conversation=${payload.conversation_id} ` +
+          `phone=${maskPhone(phone)} dry_run=${dryRun}`,
+      );
+
+      let result: SendTemplateResult;
+
+      if (dryRun) {
+        // Simulated success: no provider call, so provider_attempted is false
+        // — the one success that is a proven non-send.
+        result = {
+          accepted: true,
+          status: null,
+          message_state: "simulated",
+          provider_message_id: null,
+          chat_id: null,
+          error: null,
+          ...NOT_ATTEMPTED_OK,
+        };
+      } else {
+        // PROVIDER-ATTEMPT BOUNDARY. Everything above is local work; from the
+        // next statement on, a request may already have reached Umbler.
+        providerAttempted = true;
+        result = await sendTextMessage({ toPhone: phone, message: payload.text }, apiToken);
+      }
+
+      res.json({
+        success: result.accepted,
+        dry_run: dryRun,
+        client_id: payload.client_id,
+        conversation_id: payload.conversation_id,
+        lead_id: payload.lead_id,
+        phone: maskPhone(phone),
+        accepted: result.accepted,
+        status: result.status,
+        message_state: result.message_state,
+        provider_message_id: result.provider_message_id,
+        chat_id: result.chat_id,
+        // "accepted" means Umbler accepted/queued the request — never that it
+        // was delivered or read. See docs/INTEGRATION.md §11 and §18.
+        delivery_status: "pending",
+        error: result.error,
+        provider_attempted: result.provider_attempted,
+        failure_stage: result.failure_stage,
+      });
+    } catch (unexpected: unknown) {
+      // Sanitized: the raw message is logged server-side and never returned.
+      // An exception raised once the provider call is under way can never be
+      // reported as a proven non-send.
+      console.error("SiteFlow message: unexpected error.", unexpected);
+      if (res.headersSent) {
+        return;
+      }
+      res.status(500).json({
+        success: false,
+        error: "Unexpected dispatcher error.",
+        ...(providerAttempted ? ATTEMPTED_INDETERMINATE : NOT_ATTEMPTED_PRE_PROVIDER_ERROR),
+      });
     }
-
-    // 2. Require the shared secret header. Never leak the expected value.
-    const provided = req.header("x-siteflow-dispatch-secret");
-    if (!provided || provided !== siteflowSecret) {
-      res.status(401).json({ success: false, error: "Unauthorized." });
-      return;
-    }
-
-    // 3. Payload shape.
-    const validationError = validateSiteflowMessageRequest(req.body);
-    if (validationError) {
-      res.status(400).json({ success: false, error: validationError });
-      return;
-    }
-
-    const payload = req.body as SiteflowMessageRequest;
-
-    // 4. Same Brazilian phone rules as the template endpoint.
-    const phone = normalizePhone(payload.to_phone);
-    if (phone === null) {
-      res.status(400).json({ success: false, error: "Invalid phone number." });
-      return;
-    }
-
-    const dryRun = isDryRun();
-
-    // Never log the full phone number, the secret or the message body.
-    console.log(
-      `SiteFlow message: client=${payload.client_id} conversation=${payload.conversation_id} ` +
-        `phone=${maskPhone(phone)} dry_run=${dryRun}`,
-    );
-
-    let result: SendTemplateResult;
-
-    if (dryRun) {
-      // Simulated success: no provider call.
-      result = {
-        accepted: true,
-        status: null,
-        message_state: "simulated",
-        provider_message_id: null,
-        chat_id: null,
-        error: null,
-      };
-    } else {
-      result = await sendTextMessage({ toPhone: phone, message: payload.text }, apiToken);
-    }
-
-    res.json({
-      success: result.accepted,
-      dry_run: dryRun,
-      client_id: payload.client_id,
-      conversation_id: payload.conversation_id,
-      lead_id: payload.lead_id,
-      phone: maskPhone(phone),
-      accepted: result.accepted,
-      status: result.status,
-      message_state: result.message_state,
-      provider_message_id: result.provider_message_id,
-      chat_id: result.chat_id,
-      // "accepted" means Umbler accepted/queued the request — never that it
-      // was delivered or read. See docs/INTEGRATION.md §11 and §18.
-      delivery_status: "pending",
-      error: result.error,
-    });
   };
 }

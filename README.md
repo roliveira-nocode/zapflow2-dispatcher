@@ -162,7 +162,9 @@ the raw provider response):
       "message_state": "Processing",
       "provider_message_id": "...",
       "chat_id": "...",
-      "error": null
+      "error": null,
+      "provider_attempted": true,
+      "failure_stage": "none"
     }
   ]
 }
@@ -170,6 +172,10 @@ the raw provider response):
 
 > `accepted` means Umbler accepted the request — **not** that WhatsApp delivered
 > or read the message. `delivery_status` is always `"pending"`.
+
+> `provider_attempted` / `failure_stage` say whether Umbler was actually
+> called. Only a literal `"provider_attempted": false` proves it was not —
+> see `docs/INTEGRATION.md` §17.7.
 
 Example call (does a **real** dispatch — only run when you mean it):
 
@@ -277,14 +283,27 @@ Response (dry run):
   "provider_message_id": null,
   "chat_id": null,
   "delivery_status": "pending",
-  "error": null
+  "error": null,
+  "provider_attempted": false,
+  "failure_stage": "none"
 }
 ```
 
 Errors: `400` (invalid payload, unknown `template`, wrong `params` length, or
 invalid phone), `401` (bad secret), `403` (`Consent was not granted.` —
 never for `notificacao_interna`), `503` (secret or that template's env var
-not configured).
+not configured), `500` (unexpected dispatcher error, sanitized).
+
+**Failure metadata.** Every response of this endpoint and of
+`/api/siteflow/message` also carries `provider_attempted` and `failure_stage`.
+They answer one question — was Umbler actually called? Only a literal
+`"provider_attempted": false` proves it was not; `true`, an unexpected value
+or an absent field all mean the message may already be on its way. A dry run
+is `false` / `none` because nothing is sent. Never read "the dispatcher
+returned an error" as "the provider was not called": a timeout, a connection
+reset, a `5xx` and a malformed body are all reported as attempted. The
+dispatcher has no retry mechanism. Full contract in `docs/INTEGRATION.md`
+§17.7.
 
 Example call — safe, because `DRY_RUN=1` stops before any provider call:
 

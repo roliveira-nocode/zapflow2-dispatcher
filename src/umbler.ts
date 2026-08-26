@@ -6,6 +6,12 @@
  * body, headers and defensive response parsing are unchanged.
  */
 
+import {
+  ATTEMPTED_INDETERMINATE,
+  classifyProviderResponse,
+  type FailureStage,
+} from "./dispatch-outcome.js";
+
 // Fixed values for this proof of concept (safe to keep in source — not secrets).
 export const FROM_PHONE = "+5521990047343";
 export const ORGANIZATION_ID = "aQDFQYsjuFhKAP11";
@@ -30,6 +36,14 @@ export interface SendTemplateResult {
   provider_message_id: string | null;
   chat_id: string | null;
   error: string | null;
+  /**
+   * `false` ONLY when no provider request was initiated. Any other value —
+   * including an absent field from an older deployment — means the provider
+   * may have been called, so it is never a proven non-send. See
+   * src/dispatch-outcome.ts.
+   */
+  provider_attempted: boolean;
+  failure_stage: FailureStage;
 }
 
 /**
@@ -66,6 +80,9 @@ export async function sendTemplateMessage(
   };
 
   try {
+    // PROVIDER-ATTEMPT BOUNDARY. This fetch is deliberately the first
+    // statement of the try, so every path that reaches the catch below is at
+    // or after it and can only ever be reported as attempted.
     const response = await fetch(API_URL, {
       method: "POST",
       headers: {
@@ -106,9 +123,14 @@ export async function sendTemplateMessage(
       provider_message_id: providerMessageId,
       chat_id: chatId,
       error,
+      ...classifyProviderResponse(response.ok, response.status),
     };
   } catch (error: unknown) {
     // Never print the token; only surface the error message. Keep going.
+    //
+    // This catch sits at or after the provider-attempt boundary above: a
+    // timeout, an AbortError, a connection reset or any other throw leaves
+    // the delivery outcome unprovable, so it is always reported as attempted.
     return {
       accepted: false,
       status: null,
@@ -116,6 +138,7 @@ export async function sendTemplateMessage(
       provider_message_id: null,
       chat_id: null,
       error: error instanceof Error ? error.message : String(error),
+      ...ATTEMPTED_INDETERMINATE,
     };
   }
 }
@@ -274,6 +297,9 @@ export async function sendTextMessage(
   };
 
   try {
+    // PROVIDER-ATTEMPT BOUNDARY. This fetch is deliberately the first
+    // statement of the try, so every path that reaches the catch below is at
+    // or after it and can only ever be reported as attempted.
     const response = await fetch(MESSAGE_API_URL, {
       method: "POST",
       headers: {
@@ -314,9 +340,14 @@ export async function sendTextMessage(
       provider_message_id: providerMessageId,
       chat_id: chatId,
       error,
+      ...classifyProviderResponse(response.ok, response.status),
     };
   } catch (error: unknown) {
     // Never print the token; only surface the error message. Keep going.
+    //
+    // This catch sits at or after the provider-attempt boundary above: a
+    // timeout, an AbortError, a connection reset or any other throw leaves
+    // the delivery outcome unprovable, so it is always reported as attempted.
     return {
       accepted: false,
       status: null,
@@ -324,6 +355,7 @@ export async function sendTextMessage(
       provider_message_id: null,
       chat_id: null,
       error: error instanceof Error ? error.message : String(error),
+      ...ATTEMPTED_INDETERMINATE,
     };
   }
 }
