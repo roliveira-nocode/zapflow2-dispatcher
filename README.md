@@ -242,6 +242,15 @@ template ID.
 | `continuar_conversa` (default) | `siteflow_continuar_conversa`        | `[visitor_first_name, client_brand]` | yes                 | `SITEFLOW_TEMPLATE_ID`                        |
 | `confirmacao_contato`      | `siteflow_confirmacao_contato`       | `[visitor_first_name]`               | yes                 | `SITEFLOW_TEMPLATE_CONFIRMACAO_CONTATO_ID`    |
 | `notificacao_interna`      | `siteflow_nova_solicitacao_interna`  | `[visitor_name, visitor_phone]`      | **no**              | `SITEFLOW_TEMPLATE_NOTIFICACAO_INTERNA_ID`    |
+| `camp_primeiro_contato`    | `camp_primeiro_contato`              | `[first_name, contextual_message]`   | yes                 | `SITEFLOW_TEMPLATE_CAMP_PRIMEIRO_CONTATO_ID`  |
+| `camp_reativacao_comercial`| `camp_reativacao_comercial`          | `[first_name, contextual_reason]`    | yes                 | `SITEFLOW_TEMPLATE_CAMP_REATIVACAO_COMERCIAL_ID` |
+| `camp_convite_comercial`   | `camp_convite_comercial`             | `[first_name, contextual_invitation]`| yes                 | `SITEFLOW_TEMPLATE_CAMP_CONVITE_COMERCIAL_ID` |
+| `compartilhar_link_contextual` | `compartilhar_link_contextual`   | `[first_name, contextual_reason, link]` | yes              | `SITEFLOW_TEMPLATE_COMPARTILHAR_LINK_CONTEXTUAL_ID` |
+
+The last four are the approved **campaign** templates: registered, not
+activated. Each stays unsendable until its own env var is set and each requires
+explicit granted consent, exactly like any other visitor-facing template. Use
+`POST /api/siteflow/preflight` below to check whether one is dispatchable.
 
 `continuar_conversa` also carries the static "Receber resumo" quick-reply
 button; `notificacao_interna` carries the static "Ver resumo do contato"
@@ -317,6 +326,51 @@ curl -X POST http://localhost:3000/api/siteflow/dispatch \
 > The phone number is masked in both logs and responses — the full number is
 > never written to the console.
 
+### `POST /api/siteflow/preflight`
+
+Zero-send check: **is the dispatcher configured to send this template with this
+many params?** Built for campaign preparation, so you never have to attempt a
+real send to find out. No side effects — safe to call as often as you like.
+
+Same secret as `/api/siteflow/dispatch`. Body:
+
+```json
+{ "template": "camp_primeiro_contato", "params_count": 2 }
+```
+
+The **count only** — preflight never accepts the params themselves; it has no
+use for names, copy or links. Ready:
+
+```json
+{
+  "success": true,
+  "ready": true,
+  "template": "camp_primeiro_contato",
+  "expected_params": 2,
+  "provider_attempted": false,
+  "failure_stage": "none"
+}
+```
+
+Not ready adds a stable `code` — one of `DISPATCH_NOT_CONFIGURED`,
+`UNAUTHORIZED`, `INVALID_REQUEST`, `UNKNOWN_TEMPLATE`, `PARAMS_COUNT_MISMATCH`,
+`TEMPLATE_NOT_CONFIGURED`, `UNEXPECTED_ERROR` — plus `expected_params` once the
+key resolved. Branch on `code`, not on `error`.
+
+```bash
+curl -X POST http://localhost:3000/api/siteflow/preflight \
+  -H "Content-Type: application/json" \
+  -H "x-siteflow-dispatch-secret: $SITEFLOW_DISPATCH_SECRET" \
+  --data '{"template":"camp_primeiro_contato","params_count":2}'
+```
+
+> **It never calls the provider**, on any path. The module does not import the
+> provider transport, and its handler is built without the Umbler token — so
+> every response carries `"provider_attempted": false` by construction. It does
+> **not** check consent, param content or the phone number, and `DRY_RUN` does
+> not apply: preflight always answers "can a *real* send be made". Full contract
+> in `docs/INTEGRATION.md` §20.
+
 ## Deploying to Vercel
 
 This project is deployed to **Vercel from GitHub** — push the repository to
@@ -348,6 +402,10 @@ Vercel dashboard instead (Project → Settings → Environment Variables):
 | `SITEFLOW_TEMPLATE_ID`  | Umbler template ID for `siteflow_continuar_conversa`    |
 | `SITEFLOW_TEMPLATE_CONFIRMACAO_CONTATO_ID` | Umbler template ID for `siteflow_confirmacao_contato` |
 | `SITEFLOW_TEMPLATE_NOTIFICACAO_INTERNA_ID` | Umbler template ID for `siteflow_nova_solicitacao_interna` |
+| `SITEFLOW_TEMPLATE_CAMP_PRIMEIRO_CONTATO_ID` | Umbler template ID for `camp_primeiro_contato` (campaign) |
+| `SITEFLOW_TEMPLATE_CAMP_REATIVACAO_COMERCIAL_ID` | Umbler template ID for `camp_reativacao_comercial` (campaign) |
+| `SITEFLOW_TEMPLATE_CAMP_CONVITE_COMERCIAL_ID` | Umbler template ID for `camp_convite_comercial` (campaign) |
+| `SITEFLOW_TEMPLATE_COMPARTILHAR_LINK_CONTEXTUAL_ID` | Umbler template ID for `compartilhar_link_contextual` (campaign) |
 | `DRY_RUN`               | Leave **unset** in production — `1` only simulates sends |
 
 `PORT` is only used for the local server (`npm run dev`) and is **not needed on

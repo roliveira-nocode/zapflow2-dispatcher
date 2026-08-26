@@ -34,6 +34,13 @@ import { sendTemplateMessage, sendTextMessage, type SendTemplateResult } from ".
  * - `requiresConsent` is false only for the internal notification: it never
  *   goes to the visitor, so there is no visitor consent to require, and none
  *   is synthesized.
+ *
+ * The `camp_*` and `compartilhar_link_contextual` entries are the approved
+ * CAMPAIGN templates. Registering them here only teaches the dispatcher that
+ * they exist and how many params they take — it activates nothing: each stays
+ * unsendable until its own env var is set, and each requires explicit granted
+ * consent exactly like any other visitor-facing template. Marketing-consent
+ * semantics belong to SiteFlow, not to this registry.
  */
 export interface SiteflowTemplateSpec {
   logicalName: string;
@@ -61,6 +68,33 @@ export const SITEFLOW_TEMPLATES = {
     paramOrder: ["visitor_name", "visitor_phone"],
     requiresConsent: false,
   },
+
+  // --- Approved CAMPAIGN templates ------------------------------------
+  // Registered, not activated — see the note above the registry.
+  camp_primeiro_contato: {
+    logicalName: "camp_primeiro_contato",
+    envVar: "SITEFLOW_TEMPLATE_CAMP_PRIMEIRO_CONTATO_ID",
+    paramOrder: ["first_name", "contextual_message"],
+    requiresConsent: true,
+  },
+  camp_reativacao_comercial: {
+    logicalName: "camp_reativacao_comercial",
+    envVar: "SITEFLOW_TEMPLATE_CAMP_REATIVACAO_COMERCIAL_ID",
+    paramOrder: ["first_name", "contextual_reason"],
+    requiresConsent: true,
+  },
+  camp_convite_comercial: {
+    logicalName: "camp_convite_comercial",
+    envVar: "SITEFLOW_TEMPLATE_CAMP_CONVITE_COMERCIAL_ID",
+    paramOrder: ["first_name", "contextual_invitation"],
+    requiresConsent: true,
+  },
+  compartilhar_link_contextual: {
+    logicalName: "compartilhar_link_contextual",
+    envVar: "SITEFLOW_TEMPLATE_COMPARTILHAR_LINK_CONTEXTUAL_ID",
+    paramOrder: ["first_name", "contextual_reason", "link"],
+    requiresConsent: true,
+  },
 } as const satisfies Record<string, SiteflowTemplateSpec>;
 
 export type SiteflowTemplateKey = keyof typeof SITEFLOW_TEMPLATES;
@@ -75,7 +109,7 @@ export const DEFAULT_SITEFLOW_TEMPLATE_KEY: SiteflowTemplateKey = "continuar_con
 /** @deprecated kept for callers/logs referencing the old single-template name. */
 export const SITEFLOW_TEMPLATE_NAME = SITEFLOW_TEMPLATES[DEFAULT_SITEFLOW_TEMPLATE_KEY].logicalName;
 
-function isSiteflowTemplateKey(value: unknown): value is SiteflowTemplateKey {
+export function isSiteflowTemplateKey(value: unknown): value is SiteflowTemplateKey {
   return typeof value === "string" && Object.prototype.hasOwnProperty.call(SITEFLOW_TEMPLATES, value);
 }
 
