@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express, { type Request, type Response } from "express";
 
+import { type FailureStage } from "./dispatch-outcome.js";
 import { normalizePhone } from "./phone.js";
 import { createSiteflowMediaHandler } from "./siteflow-media.js";
 import { createSiteflowDispatchHandler, createSiteflowMessageHandler } from "./siteflow.js";
@@ -36,6 +37,10 @@ interface ContactResult {
   provider_message_id: string | null;
   chat_id: string | null;
   error: string | null;
+  // Carried through from SendTemplateResult — see src/dispatch-outcome.ts.
+  // Only a literal `provider_attempted: false` proves no provider attempt.
+  provider_attempted: boolean;
+  failure_stage: FailureStage;
 }
 
 // Templates this local dispatcher is allowed to send. For now, exactly one.
@@ -197,6 +202,8 @@ app.post("/api/dispatch", async (req: Request, res: Response) => {
         provider_message_id: null,
         chat_id: null,
         error: "Invalid phone number.",
+        provider_attempted: false,
+        failure_stage: "request_validation",
       });
       continue;
     }

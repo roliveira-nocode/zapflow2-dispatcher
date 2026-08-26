@@ -145,7 +145,9 @@ HTTP `200`:
       "message_state": "Processing",
       "provider_message_id": "abc123",
       "chat_id": "chat123",
-      "error": null
+      "error": null,
+      "provider_attempted": true,
+      "failure_stage": "none"
     },
     {
       "contact_id": "lead-1002",
@@ -156,7 +158,9 @@ HTTP `200`:
       "message_state": "Processing",
       "provider_message_id": "def456",
       "chat_id": "chat456",
-      "error": null
+      "error": null,
+      "provider_attempted": true,
+      "failure_stage": "none"
     }
   ]
 }
@@ -170,7 +174,10 @@ Top-level fields:
 - `failed` — number of contacts that were not accepted.
 - `delivery_status` — always `"pending"`. Acceptance is not delivery (section 11).
 - `results` — per-contact outcome. Each item includes `accepted`, the provider
-  `status`, `message_state`, `provider_message_id`, `chat_id`, and `error`.
+  `status`, `message_state`, `provider_message_id`, `chat_id`, `error`, and the
+  failure metadata `provider_attempted` / `failure_stage` described in §17.7.
+  A contact skipped for an invalid phone carries `"provider_attempted": false`
+  — Umbler was never called for it.
 
 Each contact is processed independently — one failure does not stop the rest, so
 a response can be a partial success (`success: false`, some `accepted`).
@@ -460,7 +467,9 @@ always behaves as documented in §4.
   "provider_message_id": null,
   "chat_id": null,
   "delivery_status": "pending",
-  "error": null
+  "error": null,
+  "provider_attempted": false,
+  "failure_stage": "none"
 }
 ```
 
@@ -470,23 +479,126 @@ that WhatsApp delivered or read the message; `delivery_status` is always
 `"pending"`. A provider rejection on a real send returns HTTP `200` with
 `"success": false`, `"accepted": false` and a populated `error`.
 
+`provider_attempted` and `failure_stage` are present on **every** response of
+this endpoint, successes included — see §17.7. Above they are `false` / `none`
+because the example is a dry run: nothing was sent. A real successful send
+returns `"provider_attempted": true`.
+
 ### 17.6 Error responses
 
-| Status | `error`                                     | Cause                                            |
-| ------ | ------------------------------------------- | ------------------------------------------------ |
-| `400`  | `"<field> is required."`                    | Missing or empty required field                   |
-| `400`  | `"consent.granted must be a boolean."`      | Wrong type for `consent.granted`                  |
-| `400`  | `"consent.granted_at must be an ISO-8601 date string."` | Unparseable timestamp              |
-| `400`  | `"template is not one of the known SiteFlow templates."` | `template` is not a key in §17.3    |
-| `400`  | `"params is required and must be a non-empty array of non-empty strings."` | `template` present but `params` missing/malformed |
-| `400`  | `"params must have exactly N value(s) for template \"...\"."` | `params.length` does not match that template |
-| `400`  | `"Invalid phone number."`                   | Phone failed Brazilian normalization              |
-| `401`  | `"Unauthorized."`                           | Missing or wrong `x-siteflow-dispatch-secret`     |
-| `403`  | `"Consent was not granted."`                | `consent.granted` is not exactly `true` — never for `notificacao_interna` |
-| `503`  | `"SiteFlow dispatch is not configured."`    | `SITEFLOW_DISPATCH_SECRET` unset on the server    |
-| `503`  | `"SiteFlow template \"<logical name>\" is not configured."` | Real send attempted with that template's env var unset — only that template is affected |
+| Status | `error`                                     | `provider_attempted` | `failure_stage`        | Cause                                            |
+| ------ | ------------------------------------------- | -------------------- | ---------------------- | ------------------------------------------------ |
+| `400`  | `"<field> is required."`                    | `false`              | `request_validation`   | Missing or empty required field                   |
+| `400`  | `"consent.granted must be a boolean."`      | `false`              | `request_validation`   | Wrong type for `consent.granted`                  |
+| `400`  | `"consent.granted_at must be an ISO-8601 date string."` | `false`  | `request_validation`   | Unparseable timestamp              |
+| `400`  | `"template is not one of the known SiteFlow templates."` | `false` | `request_validation`   | `template` is not a key in §17.3    |
+| `400`  | `"params is required and must be a non-empty array of non-empty strings."` | `false` | `request_validation` | `template` present but `params` missing/malformed |
+| `400`  | `"params must have exactly N value(s) for template \"...\"."` | `false` | `request_validation` | `params.length` does not match that template |
+| `400`  | `"Invalid phone number."`                   | `false`              | `request_validation`   | Phone failed Brazilian normalization              |
+| `401`  | `"Unauthorized."`                           | `false`              | `request_validation`   | Missing or wrong `x-siteflow-dispatch-secret`     |
+| `403`  | `"Consent was not granted."`                | `false`              | `request_validation`   | `consent.granted` is not exactly `true` — never for `notificacao_interna` |
+| `503`  | `"SiteFlow dispatch is not configured."`    | `false`              | `configuration`        | `SITEFLOW_DISPATCH_SECRET` unset on the server    |
+| `503`  | `"SiteFlow template \"<logical name>\" is not configured."` | `false` | `configuration`        | Real send attempted with that template's env var unset — only that template is affected |
+| `500`  | `"Unexpected dispatcher error."`            | `false` **or** `true` | `pre_provider_error` **or** `provider_indeterminate` | An unexpected dispatcher exception. The metadata is the only thing that tells you which side of the provider call it happened on — read §17.7 before deciding anything |
 
 All errors use the same envelope as §10: `{ "success": false, "error": "..." }`.
+
+### 17.7 Failure metadata — `provider_attempted` and `failure_stage`
+
+Every response of `/api/siteflow/dispatch` and `/api/siteflow/message` carries
+two extra fields, on successes as well as failures. They exist to answer one
+question: **was the WhatsApp provider actually called?**
+
+#### The rule
+
+> Only a literal `"provider_attempted": false` proves that no provider request
+> was initiated.
+
+`true`, `null`, an unexpected value, or the field being **absent** (an older
+dispatcher deployment) must all be read as *the provider may have been called*.
+Fail closed: when in doubt, assume the message may already be on its way.
+
+The inference below is **wrong** and must never be made:
+
+```
+the dispatcher returned an error   =>   the provider was not called
+```
+
+A request timeout, a connection reset after the request started, a provider
+`5xx`, a malformed or HTML response body, and any exception raised once the
+provider call is under way all leave the delivery outcome unprovable. Each is
+reported as attempted. In particular, `"accepted": false` on its own says
+nothing about whether Umbler was reached.
+
+#### `failure_stage`
+
+| Value                    | `provider_attempted` | Meaning                                                                 |
+| ------------------------ | -------------------- | ----------------------------------------------------------------------- |
+| `none`                   | `true` or `false`    | No failure. `false` only for a dry run — see §17.4                       |
+| `request_validation`     | `false`              | Rejected before the provider: secret header, payload, template, params, consent, phone. Caller-fixable |
+| `configuration`          | `false`              | Rejected before the provider: a required server-side env var is unset. Operator-fixable |
+| `pre_provider_error`     | `false`              | An unexpected dispatcher exception that provably happened before the provider call |
+| `provider_rejected`      | `true`               | The provider responded with a definite non-acceptance (HTTP `400`–`499`) |
+| `provider_indeterminate` | `true`               | The provider was called and the outcome cannot be proven: HTTP `5xx`, timeout, connection reset, or an exception after the call started |
+
+`status` still carries the exact provider HTTP code, so `failure_stage` does
+not restate it.
+
+#### Full mapping
+
+| Situation                                        | `provider_attempted` | `failure_stage`          | HTTP  |
+| ------------------------------------------------ | -------------------- | ------------------------ | ----- |
+| Request validation failure                        | `false`              | `request_validation`     | `400` |
+| Missing or wrong secret header                    | `false`              | `request_validation`     | `401` |
+| Consent not granted                               | `false`              | `request_validation`     | `403` |
+| `SITEFLOW_DISPATCH_SECRET` unset                  | `false`              | `configuration`          | `503` |
+| That template's provider-ID env var unset         | `false`              | `configuration`          | `503` |
+| Dry run (§17.4)                                   | `false`              | `none`                   | `200` |
+| Provider accepted the request                     | `true`               | `none`                   | `200` |
+| Provider rejection / HTTP `4xx`                   | `true`               | `provider_rejected`      | `200` |
+| Provider HTTP `5xx`                               | `true`               | `provider_indeterminate` | `200` |
+| Timeout / `AbortError`                            | `true`               | `provider_indeterminate` | `200` |
+| Connection reset / network error                  | `true`               | `provider_indeterminate` | `200` |
+| Malformed or HTML body on a non-2xx               | `true`               | per the status above     | `200` |
+| Malformed or HTML body on a `2xx`                 | `true`               | `none`                   | `200` |
+| Unexpected exception **before** the provider call | `false`              | `pre_provider_error`     | `500` |
+| Unexpected exception **after** the provider call  | `true`               | `provider_indeterminate` | `500` |
+
+A `2xx` whose body could not be parsed is still reported as accepted, exactly
+as before this contract existed. Nothing new is claimed about it —
+`delivery_status` remains `"pending"` (§11) and `provider_attempted` is `true`.
+
+#### Dry run
+
+A dry run reports `"provider_attempted": false` because nothing was sent —
+that value is correct and safe. Always combine it with `dry_run`: a dry-run
+success is not a real send.
+
+#### The `500` envelope
+
+An unexpected dispatcher exception now returns a JSON body rather than an HTML
+error page:
+
+```json
+{
+  "success": false,
+  "error": "Unexpected dispatcher error.",
+  "provider_attempted": true,
+  "failure_stage": "provider_indeterminate"
+}
+```
+
+`error` is always that fixed string — never the raw exception message, the
+Umbler token, a provider template ID, or the phone number. The status code is
+unchanged (an unhandled exception already produced a `500`).
+
+#### No retries
+
+The dispatcher has no retry mechanism and never re-sends: exactly one provider
+request per call, whatever the outcome. It does not deduplicate either — see
+§14. This metadata is diagnostic; it does not authorize a retry. Treat every
+outcome that is not an explicit `"provider_attempted": false` as potentially
+delivered.
 
 ## 18. SiteFlow free-text endpoint — `POST /api/siteflow/message`
 
@@ -549,7 +661,9 @@ response contains `"dry_run": true` and `"message_state": "simulated"`.
   "provider_message_id": null,
   "chat_id": null,
   "delivery_status": "pending",
-  "error": null
+  "error": null,
+  "provider_attempted": false,
+  "failure_stage": "none"
 }
 ```
 
@@ -560,6 +674,10 @@ message; `delivery_status` is always `"pending"`. A provider rejection on a
 real send returns HTTP `200` with `"success": false`, `"accepted": false` and
 a populated `error`.
 
+`provider_attempted` and `failure_stage` follow exactly the same contract as
+the template endpoint — see §17.7. They are present on every response of this
+endpoint too.
+
 ### 18.5 Error responses
 
 | Status | `error`                                     | Cause                                            |
@@ -569,6 +687,12 @@ a populated `error`.
 | `400`  | `"Invalid phone number."`                    | Phone failed Brazilian normalization              |
 | `401`  | `"Unauthorized."`                            | Missing or wrong `x-siteflow-dispatch-secret`     |
 | `503`  | `"SiteFlow dispatch is not configured."`     | `SITEFLOW_DISPATCH_SECRET` unset on the server    |
+| `500`  | `"Unexpected dispatcher error."`             | An unexpected dispatcher exception — read `provider_attempted` before assuming nothing was sent (§17.7) |
+
+Every response of this endpoint also carries `provider_attempted` and
+`failure_stage`: `false` / `request_validation` for the `400`s and the `401`,
+`false` / `configuration` for the `503`, and `true` plus a `provider_*` stage
+for anything that reached Umbler. See §17.7.
 
 All errors use the same envelope as §10: `{ "success": false, "error": "..." }`.
 
