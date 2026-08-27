@@ -20,6 +20,7 @@ import {
   NOT_ATTEMPTED_VALIDATION,
 } from "./dispatch-outcome.js";
 import { maskPhone, normalizePhone } from "./phone.js";
+import { validateProviderTemplateId } from "./siteflow-template-id.js";
 import { sendTemplateMessage, sendTextMessage, type SendTemplateResult } from "./umbler.js";
 
 /**
@@ -132,21 +133,48 @@ interface SiteflowDispatchRequest {
   phone: string;
   // Required unless the resolved template has requiresConsent === false.
   consent?: SiteflowConsent;
-  // Logical key into SITEFLOW_TEMPLATES. Omitted = DEFAULT_SITEFLOW_TEMPLATE_KEY.
+  // Logical key into SITEFLOW_TEMPLATES (static path) OR a free-text logical
+  // identity used only for audit/logging (dynamic path, see below). Omitted
+  // on the static path = DEFAULT_SITEFLOW_TEMPLATE_KEY.
   template?: string;
   // Required when `template` is present: the template's params, already in
   // order. Ignored when `template` is omitted (legacy params are computed
   // internally, see below) — a caller cannot use `params` to bypass the
   // legacy param computation.
   params?: string[];
+  // Dynamic campaign-template path (optional). Its presence — not the value
+  // of `template` — is what switches this request onto the dynamic path.
+  // SiteFlow resolves this server-side, from its own frozen catalog
+  // revision; the browser and the LLM never send one. Validated with the
+  // SAME validator used by /api/siteflow/preflight — see
+  // ./siteflow-template-id.ts.
+  provider_template_id?: string;
+  // Required, and must be an explicit boolean, whenever provider_template_id
+  // is present. Derived server-side by SiteFlow from the frozen template
+  // policy — never inferred here, never defaulted.
+  requires_consent?: boolean;
 }
 
-interface ValidatedSiteflowRequest {
+interface ValidatedSiteflowStaticRequest {
+  kind: "static";
   payload: SiteflowDispatchRequest;
   templateKey: SiteflowTemplateKey;
   spec: SiteflowTemplateSpec;
   params: string[];
 }
+
+interface ValidatedSiteflowDynamicRequest {
+  kind: "dynamic";
+  payload: SiteflowDispatchRequest;
+  /** Logical/internal template identity, for audit/logging only. */
+  templateIdentity: string;
+  /** Already validated with validateProviderTemplateId — safe to send as-is. */
+  providerTemplateId: string;
+  requiresConsent: boolean;
+  params: string[];
+}
+
+type ValidatedSiteflowRequest = ValidatedSiteflowStaticRequest | ValidatedSiteflowDynamicRequest;
 
 /**
  * Validate an incoming SiteFlow payload and resolve which template it
@@ -166,6 +194,14 @@ export function validateSiteflowRequest(data: unknown): string | ValidatedSitefl
     if (typeof value !== "string" || value.trim() === "") {
       return `${field} is required.`;
     }
+  }
+
+  // Dynamic campaign-template path: a server-authoritative provider ID is
+  // present. Handled entirely separately from the closed static registry
+  // below — it never performs the static arity check and never reads a
+  // per-template env var.
+  if (payload.provider_template_id !== undefined) {
+    return validateDynamicSiteflowRequest(payload);
   }
 
   // Closed set: an unrecognized `template` is rejected outright, never
@@ -216,7 +252,73 @@ export function validateSiteflowRequest(data: unknown): string | ValidatedSitefl
   // requiresConsent === false: consent is never required, and none is
   // synthesized — payload.consent, if present, is simply ignored.
 
-  return { payload: payload as SiteflowDispatchRequest, templateKey, spec, params };
+  return { kind: "static", payload: payload as SiteflowDispatchRequest, templateKey, spec, params };
+}
+
+/**
+ * Validate the dynamic campaign-template path: `provider_template_id` is
+ * present. `payload` has already passed the always-required field checks
+ * above (client_id, conversation_id, lead_id, visitor_first_name, phone).
+ *
+ * Order matches the approved contract: logical identity, then the explicit
+ * boolean requires_consent, then the provider ID (shared validator), then
+ * params shape, then — only if requires_consent === true — consent shape.
+ */
+function validateDynamicSiteflowRequest(
+  payload: Partial<SiteflowDispatchRequest>,
+): string | ValidatedSiteflowDynamicRequest {
+  // Logical/internal identity is still required for audit/logging, even
+  // though — unlike the static path — it is never checked against the
+  // closed SITEFLOW_TEMPLATES registry: the catalog it belongs to is
+  // SiteFlow's, not this dispatcher's.
+  if (typeof payload.template !== "string" || payload.template.trim() === "") {
+    return "template is required.";
+  }
+  const templateIdentity = payload.template;
+
+  if (typeof payload.requires_consent !== "boolean") {
+    return "requires_consent must be a boolean.";
+  }
+  const requiresConsent = payload.requires_consent;
+
+  const providerTemplateIdError = validateProviderTemplateId(payload.provider_template_id);
+  if (providerTemplateIdError) {
+    return providerTemplateIdError;
+  }
+  const providerTemplateId = payload.provider_template_id as string;
+
+  if (!Array.isArray(payload.params) || payload.params.some((p) => typeof p !== "string" || p.trim() === "")) {
+    return "params must be an array of non-empty strings.";
+  }
+  const params = payload.params;
+
+  if (requiresConsent) {
+    const consent = payload.consent;
+    if (typeof consent !== "object" || consent === null) {
+      return "consent is required.";
+    }
+    if (typeof consent.granted !== "boolean") {
+      return "consent.granted must be a boolean.";
+    }
+    if (typeof consent.granted_at !== "string" || Number.isNaN(Date.parse(consent.granted_at))) {
+      return "consent.granted_at must be an ISO-8601 date string.";
+    }
+    if (typeof consent.source !== "string" || consent.source.trim() === "") {
+      return "consent.source is required.";
+    }
+  }
+  // requiresConsent === false: consent is never required, and none is
+  // synthesized — payload.consent, if present, is simply ignored, exactly
+  // like the static path's requiresConsent === false case.
+
+  return {
+    kind: "dynamic",
+    payload: payload as SiteflowDispatchRequest,
+    templateIdentity,
+    providerTemplateId,
+    requiresConsent,
+    params,
+  };
 }
 
 /**
@@ -262,13 +364,20 @@ export function createSiteflowDispatchHandler(apiToken: string) {
         res.status(400).json({ success: false, error: validated, ...NOT_ATTEMPTED_VALIDATION });
         return;
       }
-      const { payload, spec, params } = validated;
+      const { payload, params } = validated;
+      // Both branches expose their own requiresConsent: the static registry's
+      // spec.requiresConsent, or the dynamic path's explicit boolean field.
+      const requiresConsent =
+        validated.kind === "static" ? validated.spec.requiresConsent : validated.requiresConsent;
+      // Logged/echoed identity: the static registry's logical name, or the
+      // dynamic path's caller-supplied logical/internal identity.
+      const templateName = validated.kind === "static" ? validated.spec.logicalName : validated.templateIdentity;
 
       // 4. Consent must be explicitly granted — nothing else counts. Skipped
-      //    entirely for a template with requiresConsent === false (only the
-      //    internal notification today): there is no visitor consent to check,
-      //    and none is ever synthesized.
-      if (spec.requiresConsent && payload.consent?.granted !== true) {
+      //    entirely when requiresConsent === false (the static internal
+      //    notification, or a dynamic template whose policy says so): there
+      //    is no visitor consent to check, and none is ever synthesized.
+      if (requiresConsent && payload.consent?.granted !== true) {
         res.status(403).json({
           success: false,
           error: "Consent was not granted.",
@@ -295,7 +404,7 @@ export function createSiteflowDispatchHandler(apiToken: string) {
       // Never log the full phone number, the secret or the template ID.
       console.log(
         `SiteFlow dispatch: client=${payload.client_id} conversation=${payload.conversation_id} ` +
-          `template=${spec.logicalName} phone=${maskPhone(phone)} dry_run=${dryRun}`,
+          `template=${templateName} phone=${maskPhone(phone)} dry_run=${dryRun}`,
       );
 
       let result: SendTemplateResult;
@@ -314,17 +423,26 @@ export function createSiteflowDispatchHandler(apiToken: string) {
           ...NOT_ATTEMPTED_OK,
         };
       } else {
-        // 6. Real sends need THIS template's provider ID from the environment.
-        //    A template whose env var is unset is unavailable on its own —
-        //    the other templates are unaffected.
-        const templateId = process.env[spec.envVar];
-        if (!templateId || templateId.trim() === "") {
-          res.status(503).json({
-            success: false,
-            error: `SiteFlow template "${spec.logicalName}" is not configured.`,
-            ...NOT_ATTEMPTED_CONFIGURATION,
-          });
-          return;
+        let templateId: string;
+        if (validated.kind === "static") {
+          // 6. Real sends need THIS template's provider ID from the
+          //    environment. A template whose env var is unset is unavailable
+          //    on its own — the other templates are unaffected.
+          const envTemplateId = process.env[validated.spec.envVar];
+          if (!envTemplateId || envTemplateId.trim() === "") {
+            res.status(503).json({
+              success: false,
+              error: `SiteFlow template "${validated.spec.logicalName}" is not configured.`,
+              ...NOT_ATTEMPTED_CONFIGURATION,
+            });
+            return;
+          }
+          templateId = envTemplateId;
+        } else {
+          // 6. Dynamic path: the provider ID came from this request, already
+          //    validated by validateProviderTemplateId — no env var to read,
+          //    nothing left to configure server-side.
+          templateId = validated.providerTemplateId;
         }
 
         // PROVIDER-ATTEMPT BOUNDARY. Everything above is local work; from the
@@ -347,7 +465,7 @@ export function createSiteflowDispatchHandler(apiToken: string) {
         client_id: payload.client_id,
         conversation_id: payload.conversation_id,
         lead_id: payload.lead_id,
-        template_name: spec.logicalName,
+        template_name: templateName,
         phone: maskPhone(phone),
         params,
         accepted: result.accepted,

@@ -52,6 +52,7 @@ import {
   type SiteflowTemplateKey,
   type SiteflowTemplateSpec,
 } from "./siteflow.js";
+import { validateProviderTemplateId } from "./siteflow-template-id.js";
 
 /**
  * Stable, machine-readable failure codes. SiteFlow branches on these, so they
@@ -70,6 +71,12 @@ export const PREFLIGHT_CODES = Object.freeze({
   PARAMS_COUNT_MISMATCH: "PARAMS_COUNT_MISMATCH",
   /** The template exists but its provider-ID env var is unset. */
   TEMPLATE_NOT_CONFIGURED: "TEMPLATE_NOT_CONFIGURED",
+  /**
+   * Dynamic path only: `provider_template_id` is missing, blank, or fails
+   * the shared strict validator (see ./siteflow-template-id.ts). The same
+   * fixtures rejected here are rejected by the real dispatch route.
+   */
+  INVALID_PROVIDER_TEMPLATE_ID: "INVALID_PROVIDER_TEMPLATE_ID",
   /** Unexpected dispatcher exception. Sanitized. */
   UNEXPECTED_ERROR: "UNEXPECTED_ERROR",
 } as const);
@@ -77,23 +84,47 @@ export const PREFLIGHT_CODES = Object.freeze({
 export type PreflightCode = (typeof PREFLIGHT_CODES)[keyof typeof PREFLIGHT_CODES];
 
 export interface SiteflowPreflightRequest {
-  /** Logical key into SITEFLOW_TEMPLATES. Never a raw provider template ID. */
+  /**
+   * Logical key into SITEFLOW_TEMPLATES (static path), or a free-text
+   * logical/internal identity (dynamic path, see `provider_template_id`
+   * below). Never a raw provider template ID either way.
+   */
   template: string;
   /**
    * How many params the caller intends to send. The COUNT only — preflight
    * deliberately does not accept the params themselves: it has no use for
    * visitor names, personalized copy or links, and accepting them would
-   * suggest it validated their content. It did not.
+   * suggest it validated their content. It did not. Static path only — the
+   * dynamic path has no registered arity to compare it against.
    */
   params_count: number;
+  /**
+   * Dynamic campaign-template path (optional). Its presence switches this
+   * request onto the dynamic path — same rule as
+   * POST /api/siteflow/dispatch. Validated with the SAME shared validator.
+   */
+  provider_template_id?: string;
+  /** Required, and must be an explicit boolean, whenever provider_template_id is present. */
+  requires_consent?: boolean;
 }
 
-/** A resolved, dispatchable-so-far request: the key exists and the arity matches. */
-export interface PreflightResolved {
+/** A resolved, dispatchable-so-far static request: the key exists and the arity matches. */
+export interface PreflightResolvedStatic {
+  kind: "static";
   templateKey: SiteflowTemplateKey;
   spec: SiteflowTemplateSpec;
   expectedParams: number;
 }
+
+/** A resolved, well-formed dynamic request — shape only, nothing to configure. */
+export interface PreflightResolvedDynamic {
+  kind: "dynamic";
+  templateIdentity: string;
+  providerTemplateId: string;
+  requiresConsent: boolean;
+}
+
+export type PreflightResolved = PreflightResolvedStatic | PreflightResolvedDynamic;
 
 /** A rejection carrying its stable code and a sanitized message. */
 export interface PreflightFailure {
@@ -119,10 +150,22 @@ export function validateSiteflowPreflightRequest(
     return { code: PREFLIGHT_CODES.INVALID_REQUEST, error: "Body must be a JSON object." };
   }
 
-  const payload = data as { template?: unknown; params_count?: unknown };
+  const payload = data as {
+    template?: unknown;
+    params_count?: unknown;
+    provider_template_id?: unknown;
+    requires_consent?: unknown;
+  };
 
   if (typeof payload.template !== "string" || payload.template.trim() === "") {
     return { code: PREFLIGHT_CODES.INVALID_REQUEST, error: "template is required." };
+  }
+
+  // Dynamic campaign-template path: same branch condition as the real
+  // dispatch route. Has no registered arity to check params_count against,
+  // so — unlike the static path below — it never reads that field.
+  if (payload.provider_template_id !== undefined) {
+    return validateDynamicSiteflowPreflightRequest(payload.template, payload);
   }
 
   // Rejects NaN and Infinity too: Number.isInteger is false for both.
@@ -160,7 +203,41 @@ export function validateSiteflowPreflightRequest(
     };
   }
 
-  return { templateKey, spec, expectedParams };
+  return { kind: "static", templateKey, spec, expectedParams };
+}
+
+/**
+ * Validate the dynamic campaign-template path: `provider_template_id` is
+ * present. `templateIdentity` has already been confirmed non-empty by the
+ * caller. Order matches the real dispatch route: requires_consent boolean,
+ * then the provider ID via the SAME shared validator — so the identical set
+ * of malformed fixtures is rejected by both routes.
+ */
+function validateDynamicSiteflowPreflightRequest(
+  templateIdentity: string,
+  payload: { requires_consent?: unknown; provider_template_id?: unknown },
+): PreflightFailure | PreflightResolvedDynamic {
+  if (typeof payload.requires_consent !== "boolean") {
+    return {
+      code: PREFLIGHT_CODES.INVALID_REQUEST,
+      error: "requires_consent must be a boolean.",
+    };
+  }
+
+  const providerTemplateIdError = validateProviderTemplateId(payload.provider_template_id);
+  if (providerTemplateIdError) {
+    return {
+      code: PREFLIGHT_CODES.INVALID_PROVIDER_TEMPLATE_ID,
+      error: providerTemplateIdError,
+    };
+  }
+
+  return {
+    kind: "dynamic",
+    templateIdentity,
+    providerTemplateId: payload.provider_template_id as string,
+    requiresConsent: payload.requires_consent,
+  };
 }
 
 /**
@@ -233,6 +310,21 @@ export function createSiteflowPreflightHandler() {
         respondFailure(res, 400, validated, NOT_ATTEMPTED_VALIDATION);
         return;
       }
+
+      if (validated.kind === "dynamic") {
+        // 6-7. Dynamic path: nothing left to configure server-side — the
+        // provider ID came from this request and already passed the shared
+        // strict validator. Ready as soon as the shape validates. No
+        // expected_params: a dynamic template has no registered arity.
+        res.json({
+          success: true,
+          ready: true,
+          template: validated.templateIdentity,
+          ...NOT_ATTEMPTED_OK,
+        });
+        return;
+      }
+
       const { templateKey, spec, expectedParams } = validated;
 
       // 6. THIS template's provider ID must be configured. DRY_RUN does NOT

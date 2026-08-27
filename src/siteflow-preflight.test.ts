@@ -510,6 +510,7 @@ test("validateSiteflowPreflightRequest: resolves a valid request", () => {
   });
   assert.equal("code" in result, false);
   if ("code" in result) throw new Error("unexpected failure");
+  if (result.kind !== "static") throw new Error("expected the static path");
   assert.equal(result.templateKey, "compartilhar_link_contextual");
   assert.equal(result.expectedParams, 3);
   assert.equal(result.spec.envVar, "SITEFLOW_TEMPLATE_COMPARTILHAR_LINK_CONTEXTUAL_ID");
@@ -543,4 +544,127 @@ test("validateSiteflowPreflightRequest: is pure — it reads no environment", ()
     params_count: 2,
   });
   assert.equal("code" in result, false);
+});
+
+// =====================================================================
+// Dynamic campaign-template path — server-authoritative provider_template_id
+//
+// Presence of `provider_template_id` switches a request onto this path,
+// bypassing the closed static registry (and its env-var configuration
+// check — there is nothing to configure server-side for a dynamic
+// template) entirely. Uses the SAME shared validator as the real dispatch
+// route in src/siteflow.ts — the fixtures below are the exact same set
+// exercised there, so a malformed ID is rejected identically by both.
+// =====================================================================
+
+const DYNAMIC_PROVIDER_ID = "aYSx9KNRwPC0hnHe";
+
+/** Same malformed fixtures exercised in src/siteflow.test.ts. */
+const INVALID_PROVIDER_TEMPLATE_IDS = [
+  "",
+  "   ",
+  "has space",
+  "semi;colon",
+  "slash/es",
+  "emoji-😀-id",
+  "a".repeat(129),
+];
+
+function dynamicPreflightBody(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    template: "camp_catalogo_dinamico_v3",
+    provider_template_id: DYNAMIC_PROVIDER_ID,
+    requires_consent: true,
+    ...overrides,
+  };
+}
+
+test("dynamic: a well-formed request reports ready, with no expected_params (no registered arity)", async () => {
+  const res = await preflight(dynamicPreflightBody());
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(bodyOf(res), {
+    success: true,
+    ready: true,
+    template: "camp_catalogo_dinamico_v3",
+    provider_attempted: false,
+    failure_stage: "none",
+  });
+});
+
+test("dynamic: params_count is not required and is never used to reject a dynamic request", async () => {
+  const body = dynamicPreflightBody();
+  delete body.params_count; // not present anyway, but explicit about intent
+  const res = await preflight(body);
+  assert.equal(res.statusCode, 200);
+  assert.equal(bodyOf(res).ready, true);
+});
+
+test("dynamic: does not read a per-template env var — ready with nothing configured server-side", async () => {
+  // Sanity: no campaign env var is set (beforeEach clears them all).
+  assert.equal(process.env.SITEFLOW_TEMPLATE_CAMP_PRIMEIRO_CONTATO_ID, undefined);
+  const res = await preflight(dynamicPreflightBody());
+  assert.equal(res.statusCode, 200);
+  assert.equal(bodyOf(res).ready, true);
+});
+
+test("dynamic: malformed provider_template_id fixtures are all rejected with INVALID_PROVIDER_TEMPLATE_ID, ready:false", async () => {
+  for (const badId of INVALID_PROVIDER_TEMPLATE_IDS) {
+    const res = await preflight(dynamicPreflightBody({ provider_template_id: badId }));
+    assert.equal(res.statusCode, 400, JSON.stringify(badId));
+    const body = bodyOf(res);
+    assert.equal(body.ready, false, JSON.stringify(badId));
+    assert.equal(body.code, PREFLIGHT_CODES.INVALID_PROVIDER_TEMPLATE_ID, JSON.stringify(badId));
+    assert.match(String(body.error), /provider_template_id/, JSON.stringify(badId));
+  }
+});
+
+test("dynamic: a blank (whitespace-only) provider_template_id is rejected with a clear code and message", async () => {
+  const res = await preflight(dynamicPreflightBody({ provider_template_id: "   " }));
+  assert.equal(res.statusCode, 400);
+  const body = bodyOf(res);
+  assert.equal(body.code, PREFLIGHT_CODES.INVALID_PROVIDER_TEMPLATE_ID);
+  assert.match(String(body.error), /provider_template_id is required/);
+});
+
+test("dynamic: template (logical identity) is still required", async () => {
+  const body = dynamicPreflightBody();
+  delete body.template;
+  const res = await preflight(body);
+  assert.equal(res.statusCode, 400);
+  assert.equal(bodyOf(res).code, PREFLIGHT_CODES.INVALID_REQUEST);
+  assert.match(String(bodyOf(res).error), /template is required/);
+});
+
+test("dynamic: a template identity outside the closed static registry still resolves (not looked up there)", async () => {
+  const res = await preflight(dynamicPreflightBody({ template: "qualquer_identidade_siteflow_v9" }));
+  assert.equal(res.statusCode, 200);
+  assert.equal(bodyOf(res).template, "qualquer_identidade_siteflow_v9");
+});
+
+test("dynamic: requires_consent missing or non-boolean fails closed with INVALID_REQUEST", async () => {
+  for (const value of [undefined, "true", 1, 0, null, {}]) {
+    const overrides: Record<string, unknown> =
+      value === undefined ? {} : { requires_consent: value };
+    const body = dynamicPreflightBody(overrides);
+    if (value === undefined) delete body.requires_consent;
+    const res = await preflight(body);
+    assert.equal(res.statusCode, 400, JSON.stringify(value));
+    const resBody = bodyOf(res);
+    assert.equal(resBody.code, PREFLIGHT_CODES.INVALID_REQUEST, JSON.stringify(value));
+    assert.match(String(resBody.error), /requires_consent must be a boolean/, JSON.stringify(value));
+  }
+});
+
+test("dynamic: requires_consent=false resolves ready — preflight never checks consent evidence either way", async () => {
+  const res = await preflight(dynamicPreflightBody({ requires_consent: false }));
+  assert.equal(res.statusCode, 200);
+  assert.equal(bodyOf(res).ready, true);
+});
+
+test("dynamic: never claims provider_attempted:true, ready or not", async () => {
+  const ready = await preflight(dynamicPreflightBody());
+  assert.equal(bodyOf(ready).provider_attempted, false);
+
+  const notReady = await preflight(dynamicPreflightBody({ provider_template_id: "" }));
+  assert.equal(bodyOf(notReady).provider_attempted, false);
 });
