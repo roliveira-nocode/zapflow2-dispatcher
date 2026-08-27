@@ -34,8 +34,14 @@
  * execution state. It creates nothing and mutates nothing — calling it twice
  * is identical to calling it once.
  *
- * A caller selects a LOGICAL key only. Raw provider template IDs are never
- * accepted as input and never appear in a response.
+ * On the static path, a caller selects a LOGICAL key only — a raw provider
+ * template ID is never accepted there. The dynamic campaign-template path
+ * (`provider_template_id` present, see validateDynamicSiteflowPreflightRequest
+ * below and ./siteflow-template-id.ts) is the one exception: SiteFlow's
+ * server sends the already-resolved provider ID directly, over the same
+ * authenticated server-to-server secret as this whole endpoint — never the
+ * browser or an LLM. Either way, a provider template ID never appears in a
+ * response.
  */
 import { type Request, type Response } from "express";
 
@@ -52,7 +58,7 @@ import {
   type SiteflowTemplateKey,
   type SiteflowTemplateSpec,
 } from "./siteflow.js";
-import { validateProviderTemplateId } from "./siteflow-template-id.js";
+import { validateProviderTemplateId, validateTemplateIdentity } from "./siteflow-template-id.js";
 
 /**
  * Stable, machine-readable failure codes. SiteFlow branches on these, so they
@@ -85,9 +91,11 @@ export type PreflightCode = (typeof PREFLIGHT_CODES)[keyof typeof PREFLIGHT_CODE
 
 export interface SiteflowPreflightRequest {
   /**
-   * Logical key into SITEFLOW_TEMPLATES (static path), or a free-text
-   * logical/internal identity (dynamic path, see `provider_template_id`
-   * below). Never a raw provider template ID either way.
+   * Logical key into SITEFLOW_TEMPLATES (static path), or a safe
+   * slug/token logical/internal identity (dynamic path, see
+   * `provider_template_id` below — it is interpolated into a server log
+   * line, so its shape is restricted). Never a raw provider template ID
+   * either way.
    */
   template: string;
   /**
@@ -157,15 +165,18 @@ export function validateSiteflowPreflightRequest(
     requires_consent?: unknown;
   };
 
-  if (typeof payload.template !== "string" || payload.template.trim() === "") {
-    return { code: PREFLIGHT_CODES.INVALID_REQUEST, error: "template is required." };
+  // Dynamic campaign-template path: same branch condition as the real
+  // dispatch route, checked first so its own template-identity validation
+  // (a safe slug/token, not just non-empty text) applies uniformly instead
+  // of the generic check below. Has no registered arity to check
+  // params_count against, so — unlike the static path below — it never
+  // reads that field.
+  if (payload.provider_template_id !== undefined) {
+    return validateDynamicSiteflowPreflightRequest(payload);
   }
 
-  // Dynamic campaign-template path: same branch condition as the real
-  // dispatch route. Has no registered arity to check params_count against,
-  // so — unlike the static path below — it never reads that field.
-  if (payload.provider_template_id !== undefined) {
-    return validateDynamicSiteflowPreflightRequest(payload.template, payload);
+  if (typeof payload.template !== "string" || payload.template.trim() === "") {
+    return { code: PREFLIGHT_CODES.INVALID_REQUEST, error: "template is required." };
   }
 
   // Rejects NaN and Infinity too: Number.isInteger is false for both.
@@ -213,10 +224,19 @@ export function validateSiteflowPreflightRequest(
  * then the provider ID via the SAME shared validator — so the identical set
  * of malformed fixtures is rejected by both routes.
  */
-function validateDynamicSiteflowPreflightRequest(
-  templateIdentity: string,
-  payload: { requires_consent?: unknown; provider_template_id?: unknown },
-): PreflightFailure | PreflightResolvedDynamic {
+function validateDynamicSiteflowPreflightRequest(payload: {
+  template?: unknown;
+  requires_consent?: unknown;
+  provider_template_id?: unknown;
+}): PreflightFailure | PreflightResolvedDynamic {
+  // Same shared validator as the real dispatch route — a safe slug/token,
+  // not just non-empty text — so the accepted shape cannot diverge.
+  const templateIdentityError = validateTemplateIdentity(payload.template);
+  if (templateIdentityError) {
+    return { code: PREFLIGHT_CODES.INVALID_REQUEST, error: templateIdentityError };
+  }
+  const templateIdentity = payload.template as string;
+
   if (typeof payload.requires_consent !== "boolean") {
     return {
       code: PREFLIGHT_CODES.INVALID_REQUEST,

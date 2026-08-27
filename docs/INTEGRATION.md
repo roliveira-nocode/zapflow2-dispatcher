@@ -482,16 +482,23 @@ registry's fixed-arity check and never reads a per-template env var.
   ID — only SiteFlow's server does, resolving it itself from its own frozen
   catalog revision before calling this endpoint, over the same authenticated
   server-to-server secret as every other SiteFlow route (§17.1).
-- `template` is still required, but is a free-text logical/internal identity
-  for audit and logging only (echoed back as `template_name`, §17.5) — it is
-  never checked against `SITEFLOW_TEMPLATES`; that closed registry belongs to
-  the static path only.
+- `template` is still required, but is a **safe slug/token** logical/internal
+  identity for audit and logging only (echoed back as `template_name`,
+  §17.5) — validated with `validateTemplateIdentity`
+  (`src/siteflow-template-id.ts`): non-empty, `A-Za-z0-9_-` only, at most 128
+  characters. It is interpolated straight into a server log line, so
+  newlines, control characters and spaces are rejected outright. It is never
+  checked against `SITEFLOW_TEMPLATES` and requires no particular prefix
+  (e.g. no `camp_` requirement) — that closed registry, and any naming
+  convention on it, belongs to the static path only.
 - `provider_template_id` is validated with the **same strict validator** used
-  by `POST /api/siteflow/preflight` (`src/siteflow-template-id.ts`) — the
-  identical fixture is rejected by both endpoints. It rejects an empty,
-  whitespace-only, malformed (unexpected characters), or unreasonably long
-  value. A valid ID is used **directly** for the provider send — no
-  per-template env var is read, and none is required.
+  by `POST /api/siteflow/preflight` (`validateProviderTemplateId`,
+  `src/siteflow-template-id.ts`) — the identical fixture is rejected by both
+  endpoints. It rejects empty, whitespace-only, malformed (characters outside
+  `A-Za-z0-9_-`), too short (under 4 characters — matches the CRM precedent
+  that informed this architecture), or too long (over 64 characters). A
+  valid ID is used **directly** for the provider send — no per-template env
+  var is read, and none is required.
 - `requires_consent` is required and must be an explicit `true`/`false` —
   derived server-side by SiteFlow from the frozen template's policy, never
   inferred or defaulted here. Missing or non-boolean is rejected with `400`
@@ -501,9 +508,11 @@ registry's fixed-arity check and never reads a per-template env var.
   `consent` evidence and fails closed if it is missing or malformed; `false`
   never requires and never fabricates it — a present `consent` object is
   simply ignored, exactly like `notificacao_interna` above.
-- `params` is required — an array of non-empty strings — and is preserved in
-  the **exact order sent**. Unlike the static path, there is no registered
-  arity to check it against: any length is accepted.
+- `params` is required to be a **non-empty** array of non-empty strings, and
+  is preserved in the **exact order sent**. Unlike the static path, there is
+  no registered arity to check it against — any length **≥ 1** is accepted,
+  with no fixed upper bound. An empty array (`params: []`) is rejected: the
+  approved SiteFlow catalog can never activate a zero-slot template.
 - The static visitor templates in §17.3 are completely unaffected — this
   path only activates when `provider_template_id` is present in the request.
 - The `SITEFLOW_TEMPLATE_CAMP_*` env vars (§17.3) are **not removed** by this
@@ -579,11 +588,15 @@ returns `"provider_attempted": true`.
 
 | Status | `error`                                        | `provider_attempted` | `failure_stage`      | Cause                                          |
 | ------ | ----------------------------------------------- | --------------------- | ----------------------- | ------------------------------------------------ |
-| `400`  | `"provider_template_id is required."`            | `false`                | `request_validation`    | `provider_template_id` missing, empty or whitespace-only |
-| `400`  | `"provider_template_id has an invalid format."`  | `false`                | `request_validation`    | Contains characters outside `[A-Za-z0-9_-]`     |
-| `400`  | `"provider_template_id must be at most 128 characters."` | `false`        | `request_validation`    | Longer than the shared validator's limit         |
+| `400`  | `"template is required."`                        | `false`                | `request_validation`    | `template` missing, empty or whitespace-only     |
+| `400`  | `"template has an invalid format."`              | `false`                | `request_validation`    | Contains characters outside `[A-Za-z0-9_-]` — includes newlines, control characters and spaces |
+| `400`  | `"template must be at most 128 characters."`     | `false`                | `request_validation`    | Longer than the shared identity validator's limit |
 | `400`  | `"requires_consent must be a boolean."`          | `false`                | `request_validation`    | Missing, or not literally `true`/`false`         |
-| `400`  | `"params must be an array of non-empty strings."`| `false`                | `request_validation`    | `params` missing, not an array, or containing an empty/non-string entry |
+| `400`  | `"provider_template_id is required."`            | `false`                | `request_validation`    | `provider_template_id` missing, empty or whitespace-only |
+| `400`  | `"provider_template_id must be at least 4 characters."` | `false`         | `request_validation`    | Shorter than the shared validator's minimum      |
+| `400`  | `"provider_template_id must be at most 64 characters."` | `false`         | `request_validation`    | Longer than the shared validator's maximum       |
+| `400`  | `"provider_template_id has an invalid format."`  | `false`                | `request_validation`    | Contains characters outside `[A-Za-z0-9_-]`     |
+| `400`  | `"params must be a non-empty array of non-empty strings."` | `false`      | `request_validation`    | `params` missing, not an array, empty (`[]`), or containing an empty/non-string entry |
 
 Note: on the dynamic path, `provider_template_id` is **never** a per-template
 configuration issue — there is no env var for it — so it can only ever fail
@@ -934,8 +947,10 @@ them would suggest it validated their content. It did not.
 
 Mirrors §17.3.1: sending `provider_template_id` (and the required
 `requires_consent`) switches the request onto the dynamic path, using the
-exact same shared provider-ID validator as `/api/siteflow/dispatch` — the
-identical set of malformed fixtures is rejected by both endpoints.
+exact same shared provider-ID validator (`validateProviderTemplateId`) AND
+the exact same shared template-identity validator
+(`validateTemplateIdentity`) as `/api/siteflow/dispatch` — the identical set
+of malformed fixtures is rejected by both endpoints, for both fields.
 
 ```json
 {
@@ -1044,9 +1059,16 @@ keeps the envelope of §10, `ready` is the answer to act on.
 | `UNEXPECTED_ERROR` | `500` | `"Unexpected dispatcher error."` | `pre_provider_error` |
 
 `code` is stable and machine-readable — branch on it, not on `error`. It is
-present on failures only. `INVALID_REQUEST` also covers a missing/non-boolean
-`requires_consent` on the dynamic path (`"requires_consent must be a
-boolean."`).
+present on failures only. On the dynamic path, `INVALID_REQUEST` also covers:
+a missing/malformed `template` identity (`"template is required."` /
+`"template has an invalid format."` / `"template must be at most 128
+characters."` — the same safe slug/token rule as §17.3.1, rejecting
+newlines, control characters and spaces) and a missing/non-boolean
+`requires_consent` (`"requires_consent must be a boolean."`).
+`INVALID_PROVIDER_TEMPLATE_ID` covers `provider_template_id` specifically:
+`"provider_template_id is required."`, `"...must be at least 4
+characters."`, `"...must be at most 64 characters."`, or `"...has an
+invalid format."` — see §17.3.1.
 
 ### 20.7 Zero-send guarantee
 

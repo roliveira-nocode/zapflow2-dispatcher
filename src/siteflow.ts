@@ -6,9 +6,17 @@
  * shared secret, its own payload, its own registry of templates.
  *
  * A CLOSED set of logical templates — SITEFLOW_TEMPLATES below — is the only
- * thing a caller may request via the optional `template` field. Each entry's
- * provider ID is never hardcoded: it is read from that entry's own env var at
- * send time. A caller can never supply a raw provider template ID.
+ * thing a caller may request via the optional `template` field on the
+ * STATIC path. Each entry's provider ID is never hardcoded: it is read from
+ * that entry's own env var at send time. A caller can never supply a raw
+ * provider template ID on this static path.
+ *
+ * The DYNAMIC campaign-template path (`provider_template_id` present) is
+ * the one exception: it lets a raw provider template ID through, but only
+ * because it is resolved server-side by SiteFlow itself, from its own
+ * frozen catalog revision, over the same authenticated server-to-server
+ * secret as this whole endpoint — never by the browser or an LLM directly.
+ * See validateDynamicSiteflowRequest below and ./siteflow-template-id.ts.
  */
 import { type Request, type Response } from "express";
 
@@ -20,7 +28,7 @@ import {
   NOT_ATTEMPTED_VALIDATION,
 } from "./dispatch-outcome.js";
 import { maskPhone, normalizePhone } from "./phone.js";
-import { validateProviderTemplateId } from "./siteflow-template-id.js";
+import { validateProviderTemplateId, validateTemplateIdentity } from "./siteflow-template-id.js";
 import { sendTemplateMessage, sendTextMessage, type SendTemplateResult } from "./umbler.js";
 
 /**
@@ -133,14 +141,17 @@ interface SiteflowDispatchRequest {
   phone: string;
   // Required unless the resolved template has requiresConsent === false.
   consent?: SiteflowConsent;
-  // Logical key into SITEFLOW_TEMPLATES (static path) OR a free-text logical
-  // identity used only for audit/logging (dynamic path, see below). Omitted
-  // on the static path = DEFAULT_SITEFLOW_TEMPLATE_KEY.
+  // Logical key into SITEFLOW_TEMPLATES (static path) OR a safe slug/token
+  // logical identity used only for audit/logging (dynamic path, see below —
+  // it is interpolated into a server log line, so its shape is restricted).
+  // Omitted on the static path = DEFAULT_SITEFLOW_TEMPLATE_KEY.
   template?: string;
-  // Required when `template` is present: the template's params, already in
-  // order. Ignored when `template` is omitted (legacy params are computed
-  // internally, see below) — a caller cannot use `params` to bypass the
-  // legacy param computation.
+  // Required when `template` is present on the static path: the template's
+  // params, already in order, exact length required. Required (non-empty)
+  // on the dynamic path too, but with no fixed arity — see
+  // validateDynamicSiteflowRequest below. Ignored when `template` is
+  // omitted (legacy params are computed internally, see below) — a caller
+  // cannot use `params` to bypass the legacy param computation.
   params?: string[];
   // Dynamic campaign-template path (optional). Its presence — not the value
   // of `template` — is what switches this request onto the dynamic path.
@@ -270,11 +281,13 @@ function validateDynamicSiteflowRequest(
   // Logical/internal identity is still required for audit/logging, even
   // though — unlike the static path — it is never checked against the
   // closed SITEFLOW_TEMPLATES registry: the catalog it belongs to is
-  // SiteFlow's, not this dispatcher's.
-  if (typeof payload.template !== "string" || payload.template.trim() === "") {
-    return "template is required.";
+  // SiteFlow's, not this dispatcher's. Restricted to a safe slug/token
+  // because it is interpolated straight into a server log line below.
+  const templateIdentityError = validateTemplateIdentity(payload.template);
+  if (templateIdentityError) {
+    return templateIdentityError;
   }
-  const templateIdentity = payload.template;
+  const templateIdentity = payload.template as string;
 
   if (typeof payload.requires_consent !== "boolean") {
     return "requires_consent must be a boolean.";
@@ -287,8 +300,16 @@ function validateDynamicSiteflowRequest(
   }
   const providerTemplateId = payload.provider_template_id as string;
 
-  if (!Array.isArray(payload.params) || payload.params.some((p) => typeof p !== "string" || p.trim() === "")) {
-    return "params must be an array of non-empty strings.";
+  // No fixed upper arity and no static-registry arity check — but the
+  // approved SiteFlow catalog can never activate a zero-slot template, so
+  // at least one param is required, same as every entry in the static
+  // registry already implies.
+  if (
+    !Array.isArray(payload.params) ||
+    payload.params.length === 0 ||
+    payload.params.some((p) => typeof p !== "string" || p.trim() === "")
+  ) {
+    return "params must be a non-empty array of non-empty strings.";
   }
   const params = payload.params;
 

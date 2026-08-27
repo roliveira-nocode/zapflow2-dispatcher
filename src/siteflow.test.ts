@@ -1120,11 +1120,13 @@ const DYNAMIC_PROVIDER_ID = "aYSx9KNRwPC0hnHe";
 const INVALID_PROVIDER_TEMPLATE_IDS = [
   "",
   "   ",
+  "a",
+  "abc",
   "has space",
   "semi;colon",
   "slash/es",
   "emoji-😀-id",
-  "a".repeat(129),
+  "a".repeat(65),
 ];
 
 function dynamicBody(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -1177,13 +1179,45 @@ test("dynamic: params order is preserved exactly, including a length the static 
   assert.deepEqual(sent.params, params);
 });
 
-test("dynamic: the old static-registry arity check never runs — any params length is accepted", async () => {
-  for (const params of [[], ["only-one"]]) {
+test("dynamic: the old static-registry FIXED arity check never runs — 1 param and >2 params both work, no upper bound", async () => {
+  for (const params of [["only-one"], ["a", "b", "c", "d", "e"]]) {
     const { calls } = mockFetchOk({ id: "wamid.arity" });
     const res = await runDispatch(dynamicBody({ params }));
     assert.equal(res.statusCode, 200, JSON.stringify(params));
     const sent = JSON.parse((calls[0] as { body: string }).body);
     assert.deepEqual(sent.params, params, JSON.stringify(params));
+  }
+});
+
+test("dynamic: an empty params array is rejected before the provider — the approved catalog cannot activate a zero-slot template", async () => {
+  const fetchCalls = blockFetch();
+  const res = await runDispatch(dynamicBody({ params: [] }));
+  assert.equal(res.statusCode, 400);
+  assert.match(
+    String((res.body as Record<string, unknown>).error),
+    /params must be a non-empty array of non-empty strings/,
+  );
+  assert.equal(fetchCalls.calls, 0);
+});
+
+test("dynamic: newline, control-character and space template identities are all rejected before any provider attempt", async () => {
+  for (const identity of [
+    "has a space",
+    "newline\nid",
+    "carriage\rreturn",
+    "tab\tid",
+    "null\0byte",
+    "\x1b[31mANSI\x1b[0m",
+  ]) {
+    const fetchCalls = blockFetch();
+    const res = await runDispatch(dynamicBody({ template: identity }));
+    assert.equal(res.statusCode, 400, JSON.stringify(identity));
+    assert.match(
+      String((res.body as Record<string, unknown>).error),
+      /template has an invalid format/,
+      JSON.stringify(identity),
+    );
+    assert.equal(fetchCalls.calls, 0, JSON.stringify(identity));
   }
 });
 

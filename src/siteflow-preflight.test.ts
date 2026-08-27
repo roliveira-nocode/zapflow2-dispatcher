@@ -563,11 +563,13 @@ const DYNAMIC_PROVIDER_ID = "aYSx9KNRwPC0hnHe";
 const INVALID_PROVIDER_TEMPLATE_IDS = [
   "",
   "   ",
+  "a",
+  "abc",
   "has space",
   "semi;colon",
   "slash/es",
   "emoji-😀-id",
-  "a".repeat(129),
+  "a".repeat(65),
 ];
 
 function dynamicPreflightBody(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -639,6 +641,24 @@ test("dynamic: a template identity outside the closed static registry still reso
   const res = await preflight(dynamicPreflightBody({ template: "qualquer_identidade_siteflow_v9" }));
   assert.equal(res.statusCode, 200);
   assert.equal(bodyOf(res).template, "qualquer_identidade_siteflow_v9");
+});
+
+test("dynamic: newline, control-character and space template identities are all rejected — never reaches ready", async () => {
+  for (const identity of [
+    "has a space",
+    "newline\nid",
+    "carriage\rreturn",
+    "tab\tid",
+    "null\0byte",
+    "\x1b[31mANSI\x1b[0m",
+  ]) {
+    const res = await preflight(dynamicPreflightBody({ template: identity }));
+    assert.equal(res.statusCode, 400, JSON.stringify(identity));
+    const body = bodyOf(res);
+    assert.equal(body.ready, false, JSON.stringify(identity));
+    assert.equal(body.code, PREFLIGHT_CODES.INVALID_REQUEST, JSON.stringify(identity));
+    assert.match(String(body.error), /template has an invalid format/, JSON.stringify(identity));
+  }
 });
 
 test("dynamic: requires_consent missing or non-boolean fails closed with INVALID_REQUEST", async () => {

@@ -294,10 +294,10 @@ this path entirely:
 
 | Field                  | Rule                                                                 |
 | ----------------------- | --------------------------------------------------------------------- |
-| `template`              | still required — a free-text logical/internal identity for audit and logging only. Not checked against `SITEFLOW_TEMPLATES` |
-| `provider_template_id`  | required. The raw Umbler/Meta provider ID, resolved **server-side by SiteFlow** from its own frozen catalog revision. Validated by the same strict validator used by `/api/siteflow/preflight` (`src/siteflow-template-id.ts`) — reject empty, whitespace-only, malformed, or unreasonably long values |
+| `template`              | still required — a safe slug/token logical/internal identity (`A-Za-z0-9_-`, ≤128 chars) for audit and logging only. Not checked against `SITEFLOW_TEMPLATES`, no required prefix |
+| `provider_template_id`  | required. The raw Umbler/Meta provider ID, resolved **server-side by SiteFlow** from its own frozen catalog revision. Validated by the same strict validator used by `/api/siteflow/preflight` (`src/siteflow-template-id.ts`) — `A-Za-z0-9_-` only, 4-64 characters |
 | `requires_consent`      | required, and must be an explicit `true`/`false` — derived server-side by SiteFlow from the frozen template's policy. Missing or non-boolean is rejected before any provider attempt |
-| `params`                | required: an array of non-empty strings, preserved in the exact order sent — **no fixed-arity check** against any registry |
+| `params`                | required: a **non-empty** array of non-empty strings, preserved in the exact order sent — no fixed upper arity, but at least one param is required (the approved catalog cannot activate a zero-slot template) |
 
 Consent then follows `requires_consent` exactly like the static path follows
 `requiresConsent`: `true` requires valid `consent` evidence (fails closed if
