@@ -401,8 +401,10 @@ Legacy shape — `template` omitted — is unchanged:
 | `consent.granted`    | boolean | when consent is required | Must be exactly `true`, otherwise `403`             |
 | `consent.granted_at` | string  | when consent is required | ISO-8601 timestamp of the consent                   |
 | `consent.source`     | string  | when consent is required | Where consent was collected, e.g. `siteflow-web`    |
-| `template`           | string  | no       | One of the closed set of logical keys in §17.3. Omitted = the legacy default |
-| `params`             | string[]| only when `template` is present | The template's params, in order, exact length required |
+| `template`           | string  | no       | One of the closed set of logical keys in §17.3, **or** a free-text logical identity on the dynamic path (§17.3.1) |
+| `params`             | string[]| only when `template` is present | The template's params, in order. Exact length required on the static path; preserved as-is, no fixed-arity check, on the dynamic path |
+| `provider_template_id` | string | no — presence switches the request onto the dynamic path, §17.3.1 | Raw Umbler/Meta provider ID, resolved server-side by SiteFlow |
+| `requires_consent`   | boolean | required when `provider_template_id` is present | Explicit consent policy for the dynamic path, §17.3.1 |
 
 ### 17.3 Templates
 
@@ -446,6 +448,76 @@ request, and never returned in a response — only the logical name is echoed
 back (`template_name` in the response, §17.5). A template whose env var is
 unset is unavailable **on its own** — a `503` naming it — the other two are
 unaffected (§17.6).
+
+### 17.3.1 Dynamic campaign-template path
+
+An alternative to the closed registry above, for campaign templates SiteFlow
+manages in its own persistent, versioned catalog instead of this
+dispatcher's static registry. Sending `provider_template_id` switches a
+request onto this path **entirely** — it never performs the static
+registry's fixed-arity check and never reads a per-template env var.
+
+```json
+{
+  "client_id": "client-example",
+  "conversation_id": "conversation-example",
+  "lead_id": "lead-example",
+  "visitor_first_name": "Ana",
+  "phone": "+5511900000000",
+  "template": "camp_catalogo_dinamico_v3",
+  "provider_template_id": "aYSx9KNRwPC0hnHe",
+  "requires_consent": true,
+  "params": ["Ana", "mensagem contextual personalizada"],
+  "consent": {
+    "granted": true,
+    "granted_at": "2026-07-28T14:00:00Z",
+    "source": "siteflow-web"
+  }
+}
+```
+
+**Design contract:**
+
+- The browser and any LLM in the loop never see or send a provider template
+  ID — only SiteFlow's server does, resolving it itself from its own frozen
+  catalog revision before calling this endpoint, over the same authenticated
+  server-to-server secret as every other SiteFlow route (§17.1).
+- `template` is still required, but is a **safe slug/token** logical/internal
+  identity for audit and logging only (echoed back as `template_name`,
+  §17.5) — validated with `validateTemplateIdentity`
+  (`src/siteflow-template-id.ts`): non-empty, `A-Za-z0-9_-` only, at most 128
+  characters. It is interpolated straight into a server log line, so
+  newlines, control characters and spaces are rejected outright. It is never
+  checked against `SITEFLOW_TEMPLATES` and requires no particular prefix
+  (e.g. no `camp_` requirement) — that closed registry, and any naming
+  convention on it, belongs to the static path only.
+- `provider_template_id` is validated with the **same strict validator** used
+  by `POST /api/siteflow/preflight` (`validateProviderTemplateId`,
+  `src/siteflow-template-id.ts`) — the identical fixture is rejected by both
+  endpoints. It rejects empty, whitespace-only, malformed (characters outside
+  `A-Za-z0-9_-`), too short (under 4 characters — matches the CRM precedent
+  that informed this architecture), or too long (over 64 characters). A
+  valid ID is used **directly** for the provider send — no per-template env
+  var is read, and none is required.
+- `requires_consent` is required and must be an explicit `true`/`false` —
+  derived server-side by SiteFlow from the frozen template's policy, never
+  inferred or defaulted here. Missing or non-boolean is rejected with `400`
+  before any provider attempt.
+- Consent then follows `requires_consent` exactly like the static path
+  follows `spec.requiresConsent` (§17.3, §17.2): `true` requires valid
+  `consent` evidence and fails closed if it is missing or malformed; `false`
+  never requires and never fabricates it — a present `consent` object is
+  simply ignored, exactly like `notificacao_interna` above.
+- `params` is required to be a **non-empty** array of non-empty strings, and
+  is preserved in the **exact order sent**. Unlike the static path, there is
+  no registered arity to check it against — any length **≥ 1** is accepted,
+  with no fixed upper bound. An empty array (`params: []`) is rejected: the
+  approved SiteFlow catalog can never activate a zero-slot template.
+- The static visitor templates in §17.3 are completely unaffected — this
+  path only activates when `provider_template_id` is present in the request.
+- The `SITEFLOW_TEMPLATE_CAMP_*` env vars (§17.3) are **not removed** by this
+  path; they remain in effect for any caller still using the static
+  `template` keys.
 
 ### 17.4 Dry-run mode
 
@@ -511,6 +583,24 @@ returns `"provider_attempted": true`.
 | `503`  | `"SiteFlow dispatch is not configured."`    | `false`              | `configuration`        | `SITEFLOW_DISPATCH_SECRET` unset on the server    |
 | `503`  | `"SiteFlow template \"<logical name>\" is not configured."` | `false` | `configuration`        | Real send attempted with that template's env var unset — only that template is affected |
 | `500`  | `"Unexpected dispatcher error."`            | `false` **or** `true` | `pre_provider_error` **or** `provider_indeterminate` | An unexpected dispatcher exception. The metadata is the only thing that tells you which side of the provider call it happened on — read §17.7 before deciding anything |
+
+**Dynamic path only** (§17.3.1), in addition to the rows above:
+
+| Status | `error`                                        | `provider_attempted` | `failure_stage`      | Cause                                          |
+| ------ | ----------------------------------------------- | --------------------- | ----------------------- | ------------------------------------------------ |
+| `400`  | `"template is required."`                        | `false`                | `request_validation`    | `template` missing, empty or whitespace-only     |
+| `400`  | `"template has an invalid format."`              | `false`                | `request_validation`    | Contains characters outside `[A-Za-z0-9_-]` — includes newlines, control characters and spaces |
+| `400`  | `"template must be at most 128 characters."`     | `false`                | `request_validation`    | Longer than the shared identity validator's limit |
+| `400`  | `"requires_consent must be a boolean."`          | `false`                | `request_validation`    | Missing, or not literally `true`/`false`         |
+| `400`  | `"provider_template_id is required."`            | `false`                | `request_validation`    | `provider_template_id` missing, empty or whitespace-only |
+| `400`  | `"provider_template_id must be at least 4 characters."` | `false`         | `request_validation`    | Shorter than the shared validator's minimum      |
+| `400`  | `"provider_template_id must be at most 64 characters."` | `false`         | `request_validation`    | Longer than the shared validator's maximum       |
+| `400`  | `"provider_template_id has an invalid format."`  | `false`                | `request_validation`    | Contains characters outside `[A-Za-z0-9_-]`     |
+| `400`  | `"params must be a non-empty array of non-empty strings."` | `false`      | `request_validation`    | `params` missing, not an array, empty (`[]`), or containing an empty/non-string entry |
+
+Note: on the dynamic path, `provider_template_id` is **never** a per-template
+configuration issue — there is no env var for it — so it can only ever fail
+with `400`/`request_validation`, never `503`/`configuration`.
 
 All errors use the same envelope as §10: `{ "success": false, "error": "..." }`.
 
@@ -844,14 +934,41 @@ unconfigured server returns `503`.
 
 | Field          | Type   | Required | Notes                                                             |
 | -------------- | ------ | -------- | ----------------------------------------------------------------- |
-| `template`     | string | yes      | A logical key from §17.3. A raw provider template ID is never accepted and never resolves |
-| `params_count` | number | yes      | A non-negative integer: how many params you intend to send         |
+| `template`     | string | yes      | A logical key from §17.3 (static path), or a free-text logical/internal identity (dynamic path, §20.2.1). A raw provider template ID is never accepted here either way |
+| `params_count` | number | yes on the static path | A non-negative integer: how many params you intend to send. Not used on the dynamic path — see §20.2.1 |
+| `provider_template_id` | string | no — presence switches to the dynamic path | Same field, same shared validator as §17.3.1 |
+| `requires_consent` | boolean | required when `provider_template_id` is present | Same field as §17.3.1 |
 
 The **count only** — preflight deliberately does not accept the params
 themselves. It has no use for names, personalized copy or links, and accepting
 them would suggest it validated their content. It did not.
 
+### 20.2.1 Dynamic campaign-template path
+
+Mirrors §17.3.1: sending `provider_template_id` (and the required
+`requires_consent`) switches the request onto the dynamic path, using the
+exact same shared provider-ID validator (`validateProviderTemplateId`) AND
+the exact same shared template-identity validator
+(`validateTemplateIdentity`) as `/api/siteflow/dispatch` — the identical set
+of malformed fixtures is rejected by both endpoints, for both fields.
+
+```json
+{
+  "template": "camp_catalogo_dinamico_v3",
+  "provider_template_id": "aYSx9KNRwPC0hnHe",
+  "requires_consent": true
+}
+```
+
+`params_count` is not read on this path — a dynamic template has no
+registered arity to compare it against, so there is nothing to check it
+against and nothing to report back either (no `expected_params` in the ready
+response, §20.5). There is also no per-template env var to check: once the
+shape validates, the request is ready.
+
 ### 20.3 What it checks, in order
+
+Static path (§17.3):
 
 1. `SITEFLOW_DISPATCH_SECRET` is configured;
 2. the request is authenticated;
@@ -860,12 +977,27 @@ them would suggest it validated their content. It did not.
 5. `params_count` matches that template's registered arity;
 6. that template's provider-ID env var is set.
 
+Dynamic path (§20.2.1) — steps 1-3 are identical, then:
+
+4. `template` (the logical/internal identity) is present and non-empty;
+5. `requires_consent` is present and strictly boolean;
+6. `provider_template_id` passes the shared strict validator (§17.3.1).
+
+No env var to check — the dynamic path has nothing left to configure
+server-side once the shape above validates.
+
 ### 20.4 What it does NOT check
 
 Recipient **consent** (that belongs to SiteFlow — see §17.3 and the consent
 rules in §17.2), the **content** of your params, the phone number, or any
 campaign state. A `ready: true` means "the dispatcher is configured to send
 this template with this many params" and nothing more.
+
+On the dynamic path, `ready: true` also does **not** mean the provider
+recognizes `provider_template_id` — only that it is well-formed. Preflight
+never calls Umbler/Meta to confirm the ID is real; it cannot, by design
+(§20.7). A well-formed but non-existent provider ID still reports `ready:
+true` here and only fails at the real send.
 
 ### 20.5 Response — ready
 
@@ -877,6 +1009,19 @@ HTTP `200`:
   "ready": true,
   "template": "camp_primeiro_contato",
   "expected_params": 2,
+  "provider_attempted": false,
+  "failure_stage": "none"
+}
+```
+
+Dynamic path (§20.2.1) — no `expected_params`, since there is no registered
+arity to report:
+
+```json
+{
+  "success": true,
+  "ready": true,
+  "template": "camp_catalogo_dinamico_v3",
   "provider_attempted": false,
   "failure_stage": "none"
 }
@@ -910,10 +1055,20 @@ keeps the envelope of §10, `ready` is the answer to act on.
 | `UNKNOWN_TEMPLATE` | `400` | `"template is not one of the known SiteFlow templates."` | `request_validation` |
 | `PARAMS_COUNT_MISMATCH` | `400` | `"params must have exactly N value(s) for template \"...\"."` | `request_validation` |
 | `TEMPLATE_NOT_CONFIGURED` | `503` | `"SiteFlow template \"<logical name>\" is not configured."` | `configuration` |
+| `INVALID_PROVIDER_TEMPLATE_ID` | `400` | Dynamic path only — see §17.3.1's provider-ID error messages | `request_validation` |
 | `UNEXPECTED_ERROR` | `500` | `"Unexpected dispatcher error."` | `pre_provider_error` |
 
 `code` is stable and machine-readable — branch on it, not on `error`. It is
-present on failures only.
+present on failures only. On the dynamic path, `INVALID_REQUEST` also covers:
+a missing/malformed `template` identity (`"template is required."` /
+`"template has an invalid format."` / `"template must be at most 128
+characters."` — the same safe slug/token rule as §17.3.1, rejecting
+newlines, control characters and spaces) and a missing/non-boolean
+`requires_consent` (`"requires_consent must be a boolean."`).
+`INVALID_PROVIDER_TEMPLATE_ID` covers `provider_template_id` specifically:
+`"provider_template_id is required."`, `"...must be at least 4
+characters."`, `"...must be at most 64 characters."`, or `"...has an
+invalid format."` — see §17.3.1.
 
 ### 20.7 Zero-send guarantee
 

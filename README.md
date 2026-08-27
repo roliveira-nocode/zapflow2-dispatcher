@@ -267,6 +267,50 @@ A per-template provider ID that is unset only disables **that** template —
 `503 { "error": "SiteFlow template \"<logical name>\" is not configured." }`
 — the other two keep working.
 
+**Dynamic campaign-template path (`provider_template_id`).** An alternative
+to the closed registry above, for campaign templates SiteFlow manages in its
+own persistent catalog. Sending `provider_template_id` — instead of, or in
+addition to, one of the `template` keys above — switches the request onto
+this path entirely:
+
+```json
+{
+  "client_id": "client-example",
+  "conversation_id": "conversation-example",
+  "lead_id": "lead-example",
+  "visitor_first_name": "Ana",
+  "phone": "+5511900000000",
+  "template": "camp_catalogo_dinamico_v3",
+  "provider_template_id": "aYSx9KNRwPC0hnHe",
+  "requires_consent": true,
+  "params": ["Ana", "mensagem contextual personalizada"],
+  "consent": {
+    "granted": true,
+    "granted_at": "2026-07-28T14:00:00Z",
+    "source": "siteflow-web"
+  }
+}
+```
+
+| Field                  | Rule                                                                 |
+| ----------------------- | --------------------------------------------------------------------- |
+| `template`              | still required — a safe slug/token logical/internal identity (`A-Za-z0-9_-`, ≤128 chars) for audit and logging only. Not checked against `SITEFLOW_TEMPLATES`, no required prefix |
+| `provider_template_id`  | required. The raw Umbler/Meta provider ID, resolved **server-side by SiteFlow** from its own frozen catalog revision. Validated by the same strict validator used by `/api/siteflow/preflight` (`src/siteflow-template-id.ts`) — `A-Za-z0-9_-` only, 4-64 characters |
+| `requires_consent`      | required, and must be an explicit `true`/`false` — derived server-side by SiteFlow from the frozen template's policy. Missing or non-boolean is rejected before any provider attempt |
+| `params`                | required: a **non-empty** array of non-empty strings, preserved in the exact order sent — no fixed upper arity, but at least one param is required (the approved catalog cannot activate a zero-slot template) |
+
+Consent then follows `requires_consent` exactly like the static path follows
+`requiresConsent`: `true` requires valid `consent` evidence (fails closed if
+missing/invalid), `false` never requires and never fabricates it.
+
+The browser and any LLM in the loop never see or send a provider template
+ID — only SiteFlow's server does, over this same authenticated
+server-to-server secret. The dynamic path never reads a per-template env
+var (there is nothing to configure server-side for it) and never performs
+the closed registry's fixed-arity check. Static visitor templates above are
+completely unaffected — this path only activates when
+`provider_template_id` is present in the request.
+
 **Dry run.** With `DRY_RUN=1` (or `true`) the request is fully validated and
 then simulated: Umbler is never called, no WhatsApp message is sent,
 `SITEFLOW_TEMPLATE_ID` is not required, and the template does not need to be
@@ -354,8 +398,42 @@ use for names, copy or links. Ready:
 
 Not ready adds a stable `code` — one of `DISPATCH_NOT_CONFIGURED`,
 `UNAUTHORIZED`, `INVALID_REQUEST`, `UNKNOWN_TEMPLATE`, `PARAMS_COUNT_MISMATCH`,
-`TEMPLATE_NOT_CONFIGURED`, `UNEXPECTED_ERROR` — plus `expected_params` once the
-key resolved. Branch on `code`, not on `error`.
+`TEMPLATE_NOT_CONFIGURED`, `INVALID_PROVIDER_TEMPLATE_ID`, `UNEXPECTED_ERROR`
+— plus `expected_params` once the key resolved (static path only). Branch on
+`code`, not on `error`.
+
+**Dynamic path.** Send `provider_template_id` and `requires_consent` instead
+of `params_count` to preflight-check the same dynamic campaign-template path
+`/api/siteflow/dispatch` accepts (see above) — using the exact same shared
+provider-ID validator, so a malformed ID is rejected identically by both
+endpoints:
+
+```json
+{
+  "template": "camp_catalogo_dinamico_v3",
+  "provider_template_id": "aYSx9KNRwPC0hnHe",
+  "requires_consent": true
+}
+```
+
+Ready:
+
+```json
+{
+  "success": true,
+  "ready": true,
+  "template": "camp_catalogo_dinamico_v3",
+  "provider_attempted": false,
+  "failure_stage": "none"
+}
+```
+
+No `expected_params` — a dynamic template has no registered arity to report.
+`params_count` is not used on this path. A missing or malformed
+`provider_template_id` returns `INVALID_PROVIDER_TEMPLATE_ID`; a missing or
+non-boolean `requires_consent` returns `INVALID_REQUEST`. Like the static
+path, this never reads a per-template env var and never reaches the
+provider — `provider_attempted` is always `false`.
 
 ```bash
 curl -X POST http://localhost:3000/api/siteflow/preflight \

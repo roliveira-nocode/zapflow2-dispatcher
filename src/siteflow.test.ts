@@ -109,6 +109,7 @@ test("validateSiteflowRequest: legacy path (no `template`) resolves the default 
   const result = validateSiteflowRequest(legacyBody());
   assert.equal(typeof result, "object");
   if (typeof result === "string") throw new Error("unexpected error: " + result);
+  if (result.kind !== "static") throw new Error("expected the static path");
   assert.equal(result.templateKey, DEFAULT_SITEFLOW_TEMPLATE_KEY);
   assert.equal(result.spec.logicalName, "siteflow_continuar_conversa");
   assert.deepEqual(result.params, ["Maria", "1pra5"]);
@@ -150,6 +151,7 @@ test("validateSiteflowRequest: notificacao_interna requires 2 params and NEVER r
   const result = validateSiteflowRequest(body);
   assert.equal(typeof result, "object");
   if (typeof result === "string") throw new Error("unexpected error: " + result);
+  if (result.kind !== "static") throw new Error("expected the static path");
   assert.equal(result.spec.requiresConsent, false);
   assert.deepEqual(result.params, ["Maria Silva", "+5511988887777"]);
 });
@@ -1095,5 +1097,284 @@ test("slice 5: a raw provider-ID-shaped string is still rejected as a template k
       candidate,
     );
   }
+  assert.equal(fetchCalls.calls, 0);
+});
+
+// =====================================================================
+// Dynamic campaign-template path — server-authoritative provider_template_id
+//
+// Siteflow resolves the provider ID server-side (frozen catalog revision)
+// and sends it directly; the browser/LLM never do. Presence of
+// `provider_template_id` — not the value of `template` — switches a request
+// onto this path entirely, bypassing the closed static registry and its
+// fixed arity check, but reusing the SAME provider-ID validator as
+// /api/siteflow/preflight (see siteflow-template-id.test.ts for its own
+// exhaustive fixture coverage; this file only checks the dispatch route
+// rejects the identical fixtures).
+// =====================================================================
+
+/** Provider-ID-SHAPED but entirely fake — never a real approved ID. */
+const DYNAMIC_PROVIDER_ID = "aYSx9KNRwPC0hnHe";
+
+/** Same malformed fixtures exercised in src/siteflow-preflight.test.ts. */
+const INVALID_PROVIDER_TEMPLATE_IDS = [
+  "",
+  "   ",
+  "a",
+  "abc",
+  "has space",
+  "semi;colon",
+  "slash/es",
+  "emoji-😀-id",
+  "a".repeat(65),
+];
+
+function dynamicBody(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    client_id: "1pra5",
+    conversation_id: "conv-1",
+    lead_id: "lead-1",
+    visitor_first_name: "Maria",
+    phone: "+5511988887777",
+    template: "camp_catalogo_dinamico_v3",
+    provider_template_id: DYNAMIC_PROVIDER_ID,
+    requires_consent: true,
+    params: ["Maria", "mensagem contextual personalizada"],
+    consent: { granted: true, granted_at: NOW, source: "siteflow-web" },
+    ...overrides,
+  };
+}
+
+test("dynamic: a valid provider_template_id sends for real, with that exact ID and params in order, never echoed back", async () => {
+  const { calls } = mockFetchOk({ id: "wamid.dyn", chatId: "chat-dyn" });
+
+  const res = await runDispatch(dynamicBody());
+
+  assert.equal(res.statusCode, 200);
+  const body = res.body as Record<string, unknown>;
+  assert.equal(body.success, true);
+  assert.equal(body.template_name, "camp_catalogo_dinamico_v3");
+  assert.deepEqual(body.params, ["Maria", "mensagem contextual personalizada"]);
+  assert.equal(body.provider_attempted, true);
+  assert.equal(body.failure_stage, "none");
+
+  const sent = JSON.parse((calls[0] as { body: string }).body);
+  assert.equal(sent.templateId, DYNAMIC_PROVIDER_ID);
+  assert.deepEqual(sent.params, ["Maria", "mensagem contextual personalizada"]);
+  assert.equal(sent.contactName, "Maria");
+
+  // The provider ID is never echoed back to the caller.
+  assert.equal(JSON.stringify(res.body).includes(DYNAMIC_PROVIDER_ID), false);
+});
+
+test("dynamic: params order is preserved exactly, including a length the static registry never uses", async () => {
+  const { calls } = mockFetchOk({ id: "wamid.order" });
+  const params = ["z-first", "a-second", "m-third", "b-fourth"];
+
+  const res = await runDispatch(dynamicBody({ params }));
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual((res.body as Record<string, unknown>).params, params);
+  const sent = JSON.parse((calls[0] as { body: string }).body);
+  assert.deepEqual(sent.params, params);
+});
+
+test("dynamic: the old static-registry FIXED arity check never runs — 1 param and >2 params both work, no upper bound", async () => {
+  for (const params of [["only-one"], ["a", "b", "c", "d", "e"]]) {
+    const { calls } = mockFetchOk({ id: "wamid.arity" });
+    const res = await runDispatch(dynamicBody({ params }));
+    assert.equal(res.statusCode, 200, JSON.stringify(params));
+    const sent = JSON.parse((calls[0] as { body: string }).body);
+    assert.deepEqual(sent.params, params, JSON.stringify(params));
+  }
+});
+
+test("dynamic: an empty params array is rejected before the provider — the approved catalog cannot activate a zero-slot template", async () => {
+  const fetchCalls = blockFetch();
+  const res = await runDispatch(dynamicBody({ params: [] }));
+  assert.equal(res.statusCode, 400);
+  assert.match(
+    String((res.body as Record<string, unknown>).error),
+    /params must be a non-empty array of non-empty strings/,
+  );
+  assert.equal(fetchCalls.calls, 0);
+});
+
+test("dynamic: newline, control-character and space template identities are all rejected before any provider attempt", async () => {
+  for (const identity of [
+    "has a space",
+    "newline\nid",
+    "carriage\rreturn",
+    "tab\tid",
+    "null\0byte",
+    "\x1b[31mANSI\x1b[0m",
+  ]) {
+    const fetchCalls = blockFetch();
+    const res = await runDispatch(dynamicBody({ template: identity }));
+    assert.equal(res.statusCode, 400, JSON.stringify(identity));
+    assert.match(
+      String((res.body as Record<string, unknown>).error),
+      /template has an invalid format/,
+      JSON.stringify(identity),
+    );
+    assert.equal(fetchCalls.calls, 0, JSON.stringify(identity));
+  }
+});
+
+test("dynamic: does not read a per-template env var — sends for real with no SITEFLOW_TEMPLATE_CAMP_* configured", async () => {
+  // Sanity: none of the static campaign env vars are set (beforeEach clears them).
+  assert.equal(process.env.SITEFLOW_TEMPLATE_CAMP_PRIMEIRO_CONTATO_ID, undefined);
+  const { calls } = mockFetchOk({ id: "wamid.noenv" });
+
+  const res = await runDispatch(dynamicBody());
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(calls.length, 1);
+});
+
+test("dynamic: malformed provider_template_id fixtures are all rejected before the provider, 400", async () => {
+  for (const badId of INVALID_PROVIDER_TEMPLATE_IDS) {
+    const fetchCalls = blockFetch();
+    const res = await runDispatch(dynamicBody({ provider_template_id: badId }));
+    assert.equal(res.statusCode, 400, JSON.stringify(badId));
+    assert.match(
+      String((res.body as Record<string, unknown>).error),
+      /provider_template_id/,
+      JSON.stringify(badId),
+    );
+    assert.equal(fetchCalls.calls, 0, JSON.stringify(badId));
+  }
+});
+
+test("dynamic: a blank (whitespace-only) provider_template_id is rejected, provider never called", async () => {
+  const fetchCalls = blockFetch();
+  const res = await runDispatch(dynamicBody({ provider_template_id: "   " }));
+  assert.equal(res.statusCode, 400);
+  assert.match(String((res.body as Record<string, unknown>).error), /provider_template_id is required/);
+  assert.equal(fetchCalls.calls, 0);
+});
+
+test("dynamic: template (logical identity) is still required even though it is not checked against the closed registry", async () => {
+  const fetchCalls = blockFetch();
+  const body = dynamicBody();
+  delete body.template;
+  const res = await runDispatch(body);
+  assert.equal(res.statusCode, 400);
+  assert.match(String((res.body as Record<string, unknown>).error), /template is required/);
+  assert.equal(fetchCalls.calls, 0);
+});
+
+test("dynamic: a template identity outside the closed static registry is accepted (not looked up there)", async () => {
+  const { calls } = mockFetchOk({ id: "wamid.freeform" });
+  const res = await runDispatch(dynamicBody({ template: "qualquer_identidade_siteflow_v9" }));
+  assert.equal(res.statusCode, 200);
+  assert.equal((res.body as Record<string, unknown>).template_name, "qualquer_identidade_siteflow_v9");
+  assert.equal(calls.length, 1);
+});
+
+test("dynamic: requires_consent missing -> rejected before the provider, 400", async () => {
+  const fetchCalls = blockFetch();
+  const body = dynamicBody();
+  delete body.requires_consent;
+  const res = await runDispatch(body);
+  assert.equal(res.statusCode, 400);
+  assert.match(String((res.body as Record<string, unknown>).error), /requires_consent must be a boolean/);
+  assert.equal(fetchCalls.calls, 0);
+});
+
+test("dynamic: requires_consent non-boolean values all fail closed before the provider", async () => {
+  for (const value of ["true", 1, 0, null, {}, ["true"]]) {
+    const fetchCalls = blockFetch();
+    const res = await runDispatch(dynamicBody({ requires_consent: value }));
+    assert.equal(res.statusCode, 400, JSON.stringify(value));
+    assert.match(
+      String((res.body as Record<string, unknown>).error),
+      /requires_consent must be a boolean/,
+      JSON.stringify(value),
+    );
+    assert.equal(fetchCalls.calls, 0, JSON.stringify(value));
+  }
+});
+
+test("dynamic: requires_consent=true with valid granted consent sends for real", async () => {
+  const { calls } = mockFetchOk({ id: "wamid.consented" });
+  const res = await runDispatch(dynamicBody({ requires_consent: true }));
+  assert.equal(res.statusCode, 200);
+  assert.equal(calls.length, 1);
+});
+
+test("dynamic: requires_consent=true with missing consent object -> 400, provider never called", async () => {
+  const fetchCalls = blockFetch();
+  const body = dynamicBody({ requires_consent: true });
+  delete body.consent;
+  const res = await runDispatch(body);
+  assert.equal(res.statusCode, 400);
+  assert.match(String((res.body as Record<string, unknown>).error), /consent is required/);
+  assert.equal(fetchCalls.calls, 0);
+});
+
+test("dynamic: requires_consent=true with consent.granted=false -> 403, provider never called", async () => {
+  const fetchCalls = blockFetch();
+  const res = await runDispatch(
+    dynamicBody({
+      requires_consent: true,
+      consent: { granted: false, granted_at: NOW, source: "siteflow-web" },
+    }),
+  );
+  assert.equal(res.statusCode, 403);
+  assert.equal((res.body as Record<string, unknown>).error, "Consent was not granted.");
+  assert.equal(fetchCalls.calls, 0);
+});
+
+test("dynamic: requires_consent=true with malformed consent shape -> 400, provider never called", async () => {
+  const fetchCalls = blockFetch();
+  const body = dynamicBody({ requires_consent: true, consent: { granted: true } });
+  const res = await runDispatch(body);
+  assert.equal(res.statusCode, 400);
+  assert.match(
+    String((res.body as Record<string, unknown>).error),
+    /consent\.granted_at must be an ISO-8601 date string/,
+  );
+  assert.equal(fetchCalls.calls, 0);
+});
+
+test("dynamic: requires_consent=false sends without consent evidence, and never fabricates it", async () => {
+  const { calls } = mockFetchOk({ id: "wamid.noconsent" });
+  const body = dynamicBody({ requires_consent: false });
+  delete body.consent;
+  const res = await runDispatch(body);
+  assert.equal(res.statusCode, 200);
+  assert.equal(calls.length, 1);
+});
+
+test("dynamic: requires_consent=false ignores a present consent object entirely, even granted:false", async () => {
+  const { calls } = mockFetchOk({ id: "wamid.ignored" });
+  const res = await runDispatch(
+    dynamicBody({
+      requires_consent: false,
+      consent: { granted: false, granted_at: NOW, source: "siteflow-web" },
+    }),
+  );
+  assert.equal(res.statusCode, 200);
+  assert.equal(calls.length, 1);
+});
+
+test("dynamic: DRY_RUN simulates without calling the provider or requiring a real provider ID's presence beyond shape", async () => {
+  process.env.DRY_RUN = "true";
+  const fetchCalls = blockFetch();
+
+  const res = await runDispatch(dynamicBody());
+  assert.equal(res.statusCode, 200);
+  const body = res.body as Record<string, unknown>;
+  assert.equal(body.dry_run, true);
+  assert.equal(body.message_state, "simulated");
+  assert.equal(body.provider_attempted, false);
+  assert.equal(fetchCalls.calls, 0);
+});
+
+test("dynamic: wrong secret header is rejected exactly like the static path, provider never called", async () => {
+  const fetchCalls = blockFetch();
+  const res = await runDispatch(dynamicBody(), { "x-siteflow-dispatch-secret": "wrong" });
+  assert.equal(res.statusCode, 401);
   assert.equal(fetchCalls.calls, 0);
 });
